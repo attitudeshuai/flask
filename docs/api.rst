@@ -706,3 +706,7 @@ Command Line Interface
 .. autodata:: run_command
 
 .. autodata:: shell_command
+
+.. autodata:: routes_command
+
+.. autodata:: config_command

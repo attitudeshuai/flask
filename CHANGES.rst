@@ -30,6 +30,8 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   Add the ``flask config`` CLI command to show the app's effective
+    configuration, with optional key filtering and ``--json`` output.
 
 
 Version 3.1.3

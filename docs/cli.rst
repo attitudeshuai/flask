@@ -146,6 +146,44 @@ context will be active, and the app instance will be imported. ::
 Use :meth:`~Flask.shell_context_processor` to add other automatic imports.
 
 
+Show Configuration
+------------------
+
+The :func:`config <cli.config_command>` command shows the app's effective
+configuration, the default config merged with any values the app sets. By
+default, each key and value is printed on its own line as ``KEY = VALUE``,
+sorted by key.
+
+.. code-block:: console
+
+    $ flask --app hello config
+    APPLICATION_ROOT = '/'
+    DEBUG = False
+    MAX_CONTENT_LENGTH = None
+    SECRET_KEY = None
+    ...
+
+Pass a key name to show only its value. An unknown key shows an error and
+exits with a non-zero code.
+
+.. code-block:: console
+
+    $ flask config SECRET_KEY
+    'dev-secret-key'
+
+Use ``--json`` to output the config as JSON instead.
+
+.. code-block:: console
+
+    $ flask config --json
+    {
+      "APPLICATION_ROOT": "/",
+      "DEBUG": false,
+      "MAX_CONTENT_LENGTH": null,
+      "SECRET_KEY": null
+    }
+
+
 .. _dotenv:
 
 Environment Variables From dotenv

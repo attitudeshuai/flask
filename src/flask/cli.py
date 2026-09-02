@@ -594,6 +594,7 @@ class FlaskGroup(AppGroup):
             self.add_command(run_command)
             self.add_command(shell_command)
             self.add_command(routes_command)
+            self.add_command(config_command)
 
         self._loaded_plugin_commands = False
 
@@ -1105,6 +1106,52 @@ def routes_command(sort: str, all_methods: bool) -> None:
 
     for row in rows:
         click.echo(template.format(*row))
+
+
+def _config_json_default(obj: t.Any) -> t.Any:
+    """Fallback serializer for config values when using ``flask config
+    --json``. The app's JSON provider ``default`` is tried first so that
+    any customization is preserved. Values it can't handle, such as
+    ``datetime.timedelta``, are shown as their ``repr`` so the output is
+    still a readable representation of the stored value.
+    """
+    try:
+        return current_app.json.default(obj)
+    except TypeError:
+        return repr(obj)
+
+
+@click.command("config", short_help="Show the app's config.")
+@click.argument("key", required=False)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output the config as JSON instead of plain text.",
+)
+@with_appcontext
+def config_command(key: str | None, as_json: bool) -> None:
+    """Show the app's effective configuration.
+
+    By default, all config keys are shown as ``KEY = VALUE`` lines,
+    sorted by key. Pass a KEY to show only its value. Use ``--json`` to
+    output the config as JSON.
+    """
+    config = current_app.config
+
+    if key is not None and key not in config:
+        raise click.BadParameter(
+            f"Unknown config key '{key}'.", param_hint="'KEY'"
+        ) from None
+
+    if as_json:
+        data: t.Any = config[key] if key is not None else dict(config)
+        click.echo(current_app.json.dumps(data, indent=2, default=_config_json_default))
+    elif key is not None:
+        click.echo(repr(config[key]))
+    else:
+        for name in sorted(config):
+            click.echo(f"{name} = {config[name]!r}")
 
 
 cli = FlaskGroup(

@@ -1,6 +1,7 @@
 # This file was part of Flask-CLI and was modified under the terms of
 # its Revised BSD License. Copyright © 2015 CERN.
 import importlib.metadata
+import json
 import os
 import platform
 import ssl
@@ -516,6 +517,72 @@ class TestRoutes:
         result = runner.invoke(cli, ["routes"])
         assert result.exit_code == 0
         assert "Host" in result.output
+
+
+class TestConfig:
+    @pytest.fixture
+    def app(self):
+        app = Flask(__name__)
+        app.config["CUSTOM_STR"] = "custom"
+        app.config["CUSTOM_INT"] = 42
+        return app
+
+    @pytest.fixture
+    def invoke(self, app, runner):
+        cli = FlaskGroup(create_app=lambda: app)
+        return partial(runner.invoke, cli)
+
+    def test_list(self, invoke, app):
+        result = invoke(["config"])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        keys = [line.split(" = ", 1)[0] for line in lines]
+        assert keys == sorted(keys)
+        # Default config and user-set values are both shown.
+        assert "DEBUG = False" in lines
+        assert "CUSTOM_STR = 'custom'" in lines
+        assert "CUSTOM_INT = 42" in lines
+        # The output matches the values stored in app.config.
+        for key in ("DEBUG", "CUSTOM_STR", "CUSTOM_INT"):
+            assert f"{key} = {app.config[key]!r}" in lines
+
+    def test_key(self, invoke):
+        result = invoke(["config", "CUSTOM_STR"])
+        assert result.exit_code == 0
+        assert result.output.strip() == repr("custom")
+
+        result = invoke(["config", "CUSTOM_INT"])
+        assert result.exit_code == 0
+        assert result.output.strip() == "42"
+
+    def test_missing_key(self, invoke):
+        result = invoke(["config", "MISSING_KEY"])
+        assert result.exit_code != 0
+        assert "MISSING_KEY" in result.output
+
+    def test_json(self, invoke, app):
+        result = invoke(["config", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["CUSTOM_STR"] == "custom"
+        assert data["CUSTOM_INT"] == 42
+        # Keys are sorted and the whole effective config is present.
+        assert list(data) == sorted(data)
+        assert data["DEBUG"] is False
+        # Values the JSON provider can't handle fall back to a readable repr.
+        assert data["PERMANENT_SESSION_LIFETIME"] == repr(
+            app.config["PERMANENT_SESSION_LIFETIME"]
+        )
+
+    def test_key_json(self, invoke):
+        result = invoke(["config", "CUSTOM_INT", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output) == 42
+
+    def test_missing_key_json(self, invoke):
+        result = invoke(["config", "MISSING_KEY", "--json"])
+        assert result.exit_code != 0
+        assert "MISSING_KEY" in result.output
 
 
 def dotenv_not_available():
