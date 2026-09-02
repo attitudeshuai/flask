@@ -230,6 +230,7 @@ class Flask(App):
             "SEND_FILE_MAX_AGE_DEFAULT": None,
             "TRAP_BAD_REQUEST_ERRORS": None,
             "TRAP_HTTP_EXCEPTIONS": False,
+            "JSON_ERROR_RESPONSES": False,
             "EXPLAIN_TEMPLATE_LOADING": False,
             "PREFERRED_URL_SCHEME": "http",
             "TEMPLATES_AUTO_RELOAD": None,
@@ -830,12 +831,42 @@ class Flask(App):
 
         return cls(self, **kwargs)  # type: ignore
 
+    def make_json_error_response(self, e: HTTPException) -> Response:
+        """Build the JSON response returned for an unhandled
+        :class:`~werkzeug.exceptions.HTTPException` when
+        :data:`JSON_ERROR_RESPONSES` is enabled.
+
+        The body is ``{"error": <description>, "status": <code>}`` and
+        the status code matches the exception. The response is created
+        with the app's :attr:`json` provider, so provider settings such
+        as :attr:`~flask.json.provider.DefaultJSONProvider.ensure_ascii`
+        are respected.
+
+        This is only called when no error handler was registered for
+        the exception. It can be overridden to customize the response.
+
+        .. versionadded:: 3.2
+        """
+        response = t.cast(
+            Response, self.json.response({"error": e.description, "status": e.code})
+        )
+
+        if e.code is not None:
+            response.status_code = e.code
+
+        return response
+
     def handle_http_exception(
         self, ctx: AppContext, e: HTTPException
     ) -> HTTPException | ft.ResponseReturnValue:
         """Handles an HTTP exception.  By default this will invoke the
         registered error handlers and fall back to returning the
         exception as response.
+
+        .. versionchanged:: 3.2
+            When the ``JSON_ERROR_RESPONSES`` config is enabled and no
+            error handler is registered, a JSON response is returned
+            instead of the default HTML error page.
 
         .. versionchanged:: 1.0.3
             ``RoutingException``, used internally for actions such as
@@ -862,6 +893,8 @@ class Flask(App):
 
         handler = self._find_error_handler(e, ctx.request.blueprints)
         if handler is None:
+            if self.config["JSON_ERROR_RESPONSES"]:
+                return self.make_json_error_response(e)
             return e
         return self.ensure_sync(handler)(e)  # type: ignore[no-any-return]
 
@@ -914,6 +947,11 @@ class Flask(App):
         always receive the ``InternalServerError``. The original
         unhandled exception is available as ``e.original_exception``.
 
+        .. versionchanged:: 3.2
+            When the ``JSON_ERROR_RESPONSES`` config is enabled and no
+            error handler is registered, a JSON response is returned
+            instead of the default HTML error page.
+
         .. versionchanged:: 1.1.0
             Always passes the ``InternalServerError`` instance to the
             handler, setting ``original_exception`` to the unhandled
@@ -947,6 +985,8 @@ class Flask(App):
 
         if handler is not None:
             server_error = self.ensure_sync(handler)(server_error)
+        elif self.config["JSON_ERROR_RESPONSES"]:
+            server_error = self.make_json_error_response(server_error)
 
         return self.finalize_request(ctx, server_error, from_error_handler=True)
 

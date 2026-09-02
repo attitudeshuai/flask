@@ -15,6 +15,8 @@ import werkzeug.serving
 from markupsafe import Markup
 from werkzeug.exceptions import BadRequest
 from werkzeug.exceptions import Forbidden
+from werkzeug.exceptions import InternalServerError
+from werkzeug.exceptions import MethodNotAllowed
 from werkzeug.exceptions import NotFound
 from werkzeug.http import parse_date
 from werkzeug.routing import BuildError
@@ -954,6 +956,163 @@ def test_baseexception_error_handling(app, client):
 
     with pytest.raises(KeyboardInterrupt):
         client.get("/")
+
+
+def test_json_error_responses_disabled_by_default(app, client):
+    """Unhandled HTTP exceptions return the default HTML error page."""
+
+    rv = client.get("/missing")
+    assert rv.status_code == 404
+    assert rv.mimetype == "text/html"
+
+
+def test_json_error_responses_http_exceptions(app, client):
+    """Unhandled HTTP exceptions return JSON with the matching status."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.route("/forbidden")
+    def forbidden():
+        flask.abort(403)
+
+    @app.route("/bad")
+    def bad():
+        flask.abort(400)
+
+    @app.route("/get", methods=["GET"])
+    def get_only():
+        return "ok"
+
+    rv = client.get("/missing")
+    assert rv.status_code == 404
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {"error": NotFound.description, "status": 404}
+
+    rv = client.get("/forbidden")
+    assert rv.status_code == 403
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {"error": Forbidden.description, "status": 403}
+
+    rv = client.get("/bad")
+    assert rv.status_code == 400
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {"error": BadRequest.description, "status": 400}
+
+    rv = client.post("/get")
+    assert rv.status_code == 405
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {
+        "error": MethodNotAllowed.description,
+        "status": 405,
+    }
+
+
+def test_json_error_responses_server_error(app, client):
+    """An unhandled exception produces a JSON 500 response."""
+    app.testing = False
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.route("/")
+    def broken_func():
+        raise ZeroDivisionError()
+
+    rv = client.get("/")
+    assert rv.status_code == 500
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {
+        "error": InternalServerError.description,
+        "status": 500,
+    }
+
+
+def test_json_error_responses_abort_server_error(app, client):
+    """An explicitly raised 500 also produces a JSON response."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.route("/")
+    def index():
+        flask.abort(500)
+
+    rv = client.get("/")
+    assert rv.status_code == 500
+    assert rv.mimetype == "application/json"
+    assert rv.get_json() == {
+        "error": InternalServerError.description,
+        "status": 500,
+    }
+
+
+def test_json_error_responses_custom_handler_priority(app, client):
+    """A registered error handler takes priority over the JSON response."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return {"custom": True}, 404
+
+    rv = client.get("/missing")
+    assert rv.status_code == 404
+    assert rv.get_json() == {"custom": True}
+
+
+def test_json_error_responses_custom_500_handler_priority(app, client):
+    """A registered 500 handler takes priority over the JSON response."""
+    app.testing = False
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.errorhandler(500)
+    def internal_server_error(e):
+        return "handled", 500
+
+    @app.route("/")
+    def broken_func():
+        raise ZeroDivisionError()
+
+    rv = client.get("/")
+    assert rv.status_code == 500
+    assert rv.data == b"handled"
+
+
+def test_json_error_responses_routing_redirect(app, client):
+    """Routing redirects (trailing slash) are not converted to JSON."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.route("/slash/")
+    def slash():
+        return "ok"
+
+    rv = client.get("/slash", follow_redirects=False)
+    assert 300 <= rv.status_code < 400
+    assert rv.location.endswith("/slash/")
+
+
+def test_json_error_responses_uses_json_provider(app, client):
+    """JSON errors are serialized with the app's JSON provider."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+    app.json.ensure_ascii = False
+
+    @app.route("/")
+    def index():
+        flask.abort(404, description="路由未找到")
+
+    rv = client.get("/")
+    assert rv.status_code == 404
+    assert rv.mimetype == "application/json"
+    assert "路由未找到" in rv.get_data(as_text=True)
+    assert rv.get_json() == {"error": "路由未找到", "status": 404}
+
+
+def test_json_error_responses_ensure_ascii_default(app, client):
+    """The provider's default ensure_ascii behavior is preserved."""
+    app.config["JSON_ERROR_RESPONSES"] = True
+
+    @app.route("/")
+    def index():
+        flask.abort(404, description="路由未找到")
+
+    rv = client.get("/")
+    assert rv.status_code == 404
+    assert "路由未找到" not in rv.get_data(as_text=True)
+    assert rv.get_json() == {"error": "路由未找到", "status": 404}
 
 
 def test_before_request_and_routing_errors(app, client):

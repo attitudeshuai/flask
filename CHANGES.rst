@@ -30,6 +30,11 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   Add the ``JSON_ERROR_RESPONSES`` config. When enabled, unhandled
+    ``HTTPException`` errors (such as 404 and 500) return a JSON response
+    ``{"error": <description>, "status": <code>}`` instead of the default
+    HTML error page. Registered error handlers still take precedence, and
+    serialization uses the app's ``json`` provider.
 
 
 Version 3.1.3
