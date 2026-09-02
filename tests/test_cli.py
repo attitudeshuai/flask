@@ -1,6 +1,7 @@
 # This file was part of Flask-CLI and was modified under the terms of
 # its Revised BSD License. Copyright © 2015 CERN.
 import importlib.metadata
+import json
 import os
 import platform
 import ssl
@@ -516,6 +517,75 @@ class TestRoutes:
         result = runner.invoke(cli, ["routes"])
         assert result.exit_code == 0
         assert "Host" in result.output
+
+    def test_json(self, invoke):
+        result = invoke(["routes", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert [route["endpoint"] for route in data] == [
+            "aaa_post",
+            "static",
+            "yyy_get_post",
+        ]
+        assert data[0] == {
+            "endpoint": "aaa_post",
+            "methods": ["POST"],
+            "rule": "/zzz_post",
+        }
+        yyy = next(route for route in data if route["endpoint"] == "yyy_get_post")
+        assert yyy["rule"] == "/get_post/<int:x>/<int:y>"
+        # HEAD and OPTIONS are filtered out by default, same as the table.
+        assert yyy["methods"] == ["GET", "POST"]
+        # No domain field when subdomains/hosts are not used.
+        assert all(
+            "subdomain" not in route and "host" not in route for route in data
+        )
+
+    def test_json_all_methods(self, invoke):
+        result = invoke(["routes", "--json", "--all-methods"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        yyy = next(route for route in data if route["endpoint"] == "yyy_get_post")
+        assert yyy["methods"] == ["GET", "HEAD", "OPTIONS", "POST"]
+
+    def test_json_sort(self, invoke):
+        result = invoke(["routes", "--json", "-s", "rule"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert [route["endpoint"] for route in data] == [
+            "yyy_get_post",
+            "static",
+            "aaa_post",
+        ]
+
+    def test_json_no_routes(self, runner):
+        app = Flask(__name__, static_folder=None)
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output) == []
+
+    def test_json_subdomain(self, runner):
+        app = Flask(__name__, static_folder=None)
+        app.add_url_rule("/a", subdomain="a", endpoint="a")
+        app.add_url_rule("/b", subdomain="b", endpoint="b")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert [route["subdomain"] for route in data] == ["a", "b"]
+        assert all("host" not in route for route in data)
+
+    def test_json_host(self, runner):
+        app = Flask(__name__, static_folder=None, host_matching=True)
+        app.add_url_rule("/a", host="a", endpoint="a")
+        app.add_url_rule("/b", host="b", endpoint="b")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert [route["host"] for route in data] == ["a", "b"]
+        assert all("subdomain" not in route for route in data)
 
 
 def dotenv_not_available():

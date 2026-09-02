@@ -4,6 +4,7 @@ import ast
 import collections.abc as cabc
 import importlib.metadata
 import inspect
+import json
 import os
 import platform
 import re
@@ -11,7 +12,6 @@ import sys
 import traceback
 import typing as t
 from functools import update_wrapper
-from operator import itemgetter
 from types import ModuleType
 
 import click
@@ -1057,46 +1057,65 @@ def shell_command() -> None:
     ),
 )
 @click.option("--all-methods", is_flag=True, help="Show HEAD and OPTIONS methods.")
+@click.option("--json", "as_json", is_flag=True, help="Output the routes as JSON.")
 @with_appcontext
-def routes_command(sort: str, all_methods: bool) -> None:
+def routes_command(sort: str, all_methods: bool, as_json: bool) -> None:
     """Show all registered routes with endpoints and methods."""
     rules = list(current_app.url_map.iter_rules())
 
     if not rules:
-        click.echo("No routes were registered.")
+        click.echo("[]" if as_json else "No routes were registered.")
         return
 
     ignored_methods = set() if all_methods else {"HEAD", "OPTIONS"}
     host_matching = current_app.url_map.host_matching
     has_domain = any(rule.host if host_matching else rule.subdomain for rule in rules)
-    rows = []
+    routes = []
 
     for rule in rules:
-        row = [
-            rule.endpoint,
-            ", ".join(sorted((rule.methods or set()) - ignored_methods)),
-        ]
+        route = {
+            "endpoint": rule.endpoint,
+            "methods": sorted((rule.methods or set()) - ignored_methods),
+        }
 
         if has_domain:
-            row.append((rule.host if host_matching else rule.subdomain) or "")
+            route["host" if host_matching else "subdomain"] = (
+                rule.host if host_matching else rule.subdomain
+            ) or ""
 
-        row.append(rule.rule)
-        rows.append(row)
+        route["rule"] = rule.rule
+        routes.append(route)
+
+    if sort == "methods":
+        routes.sort(key=lambda route: ", ".join(route["methods"]))
+    elif sort == "domain" and has_domain:
+        routes.sort(key=lambda route: route["host" if host_matching else "subdomain"])
+    elif sort in {"endpoint", "rule"}:
+        routes.sort(key=lambda route: route[sort])
+    # "match" and an unavailable "domain" sort keep the order that the
+    # routes are matched in when dispatching a request.
+
+    if as_json:
+        click.echo(json.dumps(routes))
+        return
 
     headers = ["Endpoint", "Methods"]
-    sorts = ["endpoint", "methods"]
 
     if has_domain:
         headers.append("Host" if host_matching else "Subdomain")
-        sorts.append("domain")
 
     headers.append("Rule")
-    sorts.append("rule")
 
-    try:
-        rows.sort(key=itemgetter(sorts.index(sort)))
-    except ValueError:
-        pass
+    rows = []
+
+    for route in routes:
+        row = [route["endpoint"], ", ".join(route["methods"])]
+
+        if has_domain:
+            row.append(route["host" if host_matching else "subdomain"])
+
+        row.append(route["rule"])
+        rows.append(row)
 
     rows.insert(0, headers)
     widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
