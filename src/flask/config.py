@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import errno
 import json
 import os
 import types
 import typing as t
+from dataclasses import dataclass
 
 from werkzeug.utils import import_string
 
@@ -15,6 +17,38 @@ if t.TYPE_CHECKING:
 
 
 T = t.TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ConfigSource:
+    """Describes how a config key's current value was set.
+
+    Instances are returned by :meth:`Config.get_source`. Only the
+    attributes relevant to :attr:`method` are populated, the others are
+    ``None``.
+
+    :param method: how the value was loaded: ``"default"`` (passed to
+        the constructor), ``"direct"`` (direct item assignment),
+        ``"pyfile"``, ``"envvar"``, ``"object"``, ``"file"``,
+        ``"mapping"`` or ``"prefixed_env"``.
+    :param path: resolved path of the file that was loaded, for the
+        ``"pyfile"``, ``"envvar"`` and ``"file"`` methods.
+    :param name: name of the object for ``"object"``, or the name of
+        the environment variable for ``"envvar"`` and
+        ``"prefixed_env"``.
+    :param prefix: prefix used by ``"prefixed_env"``.
+    """
+
+    method: str
+    path: str | None = None
+    name: str | None = None
+    prefix: str | None = None
+
+
+_DEFAULT_SOURCE = ConfigSource("default")
+_DIRECT_SOURCE = ConfigSource("direct")
+_MAPPING_SOURCE = ConfigSource("mapping")
+_missing = object()
 
 
 class ConfigAttribute(t.Generic[T]):
@@ -85,19 +119,70 @@ class Config(dict):  # type: ignore[type-arg]
 
     On windows use `set` instead.
 
+    In addition to behaving like a regular dict, the source of the
+    current value of each key is tracked and can be inspected with
+    :meth:`get_source`.
+
     :param root_path: path to which files are read relative from.  When the
                       config object is created by the application, this is
                       the application's :attr:`~flask.Flask.root_path`.
     :param defaults: an optional dictionary of default values
     """
 
+    #: Source recorded for each key, keyed by config key.
+    _sources: dict[str, ConfigSource]
+
     def __init__(
         self,
         root_path: str | os.PathLike[str],
         defaults: dict[str, t.Any] | None = None,
     ) -> None:
+        # ``dict.__init__`` does not dispatch to the overridden
+        # ``__setitem__``, so the sources have to be recorded explicitly.
+        object.__setattr__(self, "_sources", {})
         super().__init__(defaults or {})
+
+        if defaults is not None:
+            for key in defaults:
+                self._sources[key] = _DEFAULT_SOURCE
+
         self.root_path = root_path
+
+    def _set_source(self, key: str, source: ConfigSource) -> None:
+        """Record ``source`` for ``key``, creating the tracking dict when
+        necessary (for example when an unpickled config is repopulated
+        before its state is restored)."""
+        try:
+            sources = self._sources
+        except AttributeError:
+            sources = {}
+            object.__setattr__(self, "_sources", sources)
+
+        sources[key] = source
+
+    def _set(self, key: str, value: t.Any, source: ConfigSource) -> None:
+        """Set ``key`` and record ``source`` for it. Item assignment still
+        goes through ``__setitem__`` so subclasses overriding it keep
+        working, then the source is corrected afterwards."""
+        self[key] = value
+        self._set_source(key, source)
+
+    def get_source(self, key: str) -> ConfigSource | None:
+        """Return the source of the current value of ``key``.
+
+        The source describes which loader most recently set the key and
+        the context it was loaded from (file path, object or environment
+        variable name, environment variable prefix).
+
+        Keys passed as ``defaults`` when the config was created have the
+        ``"default"`` source. Keys set by direct assignment or regular
+        dict mutation methods such as :meth:`update` have the ``"direct"``
+        source.
+
+        :return: The :class:`ConfigSource`, or ``None`` if the key does
+            not exist or has no recorded source.
+        """
+        return self._sources.get(key)
 
     def from_envvar(self, variable_name: str, silent: bool = False) -> bool:
         """Loads a configuration from an environment variable pointing to
@@ -121,7 +206,9 @@ class Config(dict):  # type: ignore[type-arg]
                 " this variable and make it point to a configuration"
                 " file"
             )
-        return self.from_pyfile(rv, silent=silent)
+        filename = os.path.join(self.root_path, rv)
+        source = ConfigSource("envvar", path=filename, name=variable_name)
+        return self._load_pyfile(rv, silent=silent, source=source)
 
     def from_prefixed_env(
         self, prefix: str = "FLASK", *, loads: t.Callable[[str], t.Any] = json.loads
@@ -138,7 +225,9 @@ class Config(dict):  # type: ignore[type-arg]
 
         Specific items in nested dicts can be set by separating the
         keys with double underscores (``__``). If an intermediate key
-        doesn't exist, it will be initialized to an empty dict.
+        doesn't exist, it will be initialized to an empty dict. Only
+        the final (leaf) key of a nested variable is considered set by
+        the environment variable; intermediate keys are not attributed.
 
         :param prefix: Load env vars that start with this prefix,
             separated with an underscore (``_``).
@@ -149,14 +238,14 @@ class Config(dict):  # type: ignore[type-arg]
 
         .. versionadded:: 2.1
         """
-        prefix = f"{prefix}_"
+        env_prefix = f"{prefix}_"
 
-        for key in sorted(os.environ):
-            if not key.startswith(prefix):
+        for env_key in sorted(os.environ):
+            if not env_key.startswith(env_prefix):
                 continue
 
-            value = os.environ[key]
-            key = key.removeprefix(prefix)
+            value = os.environ[env_key]
+            key = env_key.removeprefix(env_prefix)
 
             try:
                 value = loads(value)
@@ -164,9 +253,11 @@ class Config(dict):  # type: ignore[type-arg]
                 # Keep the value as a string if loading failed.
                 pass
 
+            source = ConfigSource("prefixed_env", prefix=prefix, name=env_key)
+
             if "__" not in key:
                 # A non-nested key, set directly.
-                self[key] = value
+                self._set(key, value, source)
                 continue
 
             # Traverse nested dictionaries with keys separated by "__".
@@ -174,9 +265,15 @@ class Config(dict):  # type: ignore[type-arg]
             *parts, tail = key.split("__")
 
             for part in parts:
-                # If an intermediate dict does not exist, create it.
+                # If an intermediate dict does not exist, create it. It
+                # is not attributed to the environment variable: only
+                # the leaf is.
                 if part not in current:
-                    current[part] = {}
+                    if current is self:
+                        self[part] = {}
+                        self._sources.pop(part, None)
+                    else:
+                        current[part] = {}
 
                 current = current[part]
 
@@ -201,6 +298,16 @@ class Config(dict):  # type: ignore[type-arg]
         .. versionadded:: 0.7
            `silent` parameter.
         """
+        path = os.path.join(self.root_path, filename)
+        source = ConfigSource("pyfile", path=path)
+        return self._load_pyfile(filename, silent=silent, source=source)
+
+    def _load_pyfile(
+        self,
+        filename: str | os.PathLike[str],
+        silent: bool,
+        source: ConfigSource,
+    ) -> bool:
         filename = os.path.join(self.root_path, filename)
         d = types.ModuleType("config")
         d.__file__ = filename
@@ -212,7 +319,7 @@ class Config(dict):  # type: ignore[type-arg]
                 return False
             e.strerror = f"Unable to load configuration file ({e.strerror})"
             raise
-        self.from_object(d)
+        self._load_object(d, source)
         return True
 
     def from_object(self, obj: object | str) -> None:
@@ -249,9 +356,14 @@ class Config(dict):  # type: ignore[type-arg]
         """
         if isinstance(obj, str):
             obj = import_string(obj)
+
+        name = getattr(obj, "__name__", None) or obj.__class__.__name__
+        self._load_object(obj, ConfigSource("object", name=name))
+
+    def _load_object(self, obj: object, source: ConfigSource) -> None:
         for key in dir(obj):
             if key.isupper():
-                self[key] = getattr(obj, key)
+                self._set(key, getattr(obj, key), source)
 
     def from_file(
         self,
@@ -299,7 +411,7 @@ class Config(dict):  # type: ignore[type-arg]
             e.strerror = f"Unable to load configuration file ({e.strerror})"
             raise
 
-        return self.from_mapping(obj)
+        return self._load_mapping(obj, ConfigSource("file", path=filename))
 
     def from_mapping(
         self, mapping: t.Mapping[str, t.Any] | None = None, **kwargs: t.Any
@@ -315,9 +427,14 @@ class Config(dict):  # type: ignore[type-arg]
         if mapping is not None:
             mappings.update(mapping)
         mappings.update(kwargs)
+        return self._load_mapping(mappings, _MAPPING_SOURCE)
+
+    def _load_mapping(
+        self, mappings: t.Mapping[str, t.Any], source: ConfigSource
+    ) -> bool:
         for key, value in mappings.items():
             if key.isupper():
-                self[key] = value
+                self._set(key, value, source)
         return True
 
     def get_namespace(
@@ -362,6 +479,75 @@ class Config(dict):  # type: ignore[type-arg]
                 key = key.lower()
             rv[key] = v
         return rv
+
+    # Overrides of mutating dict methods so the tracked sources stay in
+    # sync. These all behave exactly like the dict equivalents.
+
+    def __setitem__(self, key: str, value: t.Any) -> None:
+        super().__setitem__(key, value)
+        self._set_source(key, _DIRECT_SOURCE)
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        self._sources.pop(key, None)
+
+    def pop(self, key: str, default: t.Any = _missing) -> t.Any:
+        try:
+            value = super().pop(key)
+        except KeyError:
+            if default is _missing:
+                raise
+            return default
+
+        self._sources.pop(key, None)
+        return value
+
+    def popitem(self) -> tuple[str, t.Any]:
+        key, value = super().popitem()
+        self._sources.pop(key, None)
+        return key, value
+
+    def clear(self) -> None:
+        super().clear()
+        self._sources.clear()
+
+    def setdefault(self, key: str, default: t.Any = None) -> t.Any:
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, *args: t.Any, **kwargs: t.Any) -> None:
+        super().update(*args, **kwargs)
+
+        try:
+            sources = self._sources
+        except AttributeError:
+            return
+
+        if args:
+            mapping = args[0]
+
+            if hasattr(mapping, "keys"):
+                keys: t.Iterable[t.Any] = mapping.keys()
+            else:
+                keys = (key for key, _ in mapping)
+
+            for key in keys:
+                sources[key] = _DIRECT_SOURCE
+
+        for key in kwargs:
+            sources[key] = _DIRECT_SOURCE
+
+    def __deepcopy__(self, memo: dict[int, t.Any]) -> te.Self:
+        # The default reconstruction of a dict subclass re-adds the items
+        # through ``__setitem__`` after restoring the state, which would
+        # turn every source into ``"direct"``. Restore the items without
+        # going through ``__setitem__`` so the copied sources are kept.
+        other = self.__class__.__new__(self.__class__)
+        memo[id(self)] = other
+        dict.update(other, copy.deepcopy(dict(self), memo))
+        other.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        return other
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {dict.__repr__(self)}>"
