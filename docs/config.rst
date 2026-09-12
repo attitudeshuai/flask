@@ -394,6 +394,26 @@ The following configuration values are used internally by Flask:
     responses. This can be overridden per route by altering the
     ``provide_automatic_options`` attribute.
 
+.. py:data:: DUPLICATE_URL_RULES
+
+    What to do when different endpoints register the same final URL rule
+    (after applying blueprint URL prefixes) with overlapping HTTP
+    methods. The first registered rule handles all such requests, so the
+    later view function would never run.
+
+    - ``"warn"`` (the default): emit a :class:`UserWarning` naming the
+      rule, the overlapping methods, and both endpoints.
+    - ``"error"``: raise an ``AssertionError`` when registering the
+      duplicate rule.
+    - ``"ignore"`` (also ``False`` or ``None``): do not check.
+
+    Rules with methods that do not overlap, such as one handling only
+    ``GET`` and another only ``POST``, are not considered duplicates.
+    Rules on different subdomains or hosts, and multiple rules stacked
+    on the same endpoint, are always allowed.
+
+    .. versionadded:: 3.2
+
 .. versionadded:: 0.4
    ``LOGGER_NAME``
 

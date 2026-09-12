@@ -30,6 +30,12 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   The ``DUPLICATE_URL_RULES`` config controls detection when different
+    endpoints register the same final URL rule with overlapping HTTP
+    methods. It defaults to ``"warn"`` and can be set to ``"error"`` to
+    raise an exception or ``"ignore"`` to disable the check. Rules with
+    disjoint methods, different subdomains or hosts, or the same endpoint
+    are not affected.
 
 
 Version 3.1.3

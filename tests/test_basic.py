@@ -1878,6 +1878,176 @@ def test_multi_route_class_views(app, client):
     assert rv.data == b"b"
 
 
+def test_duplicate_url_rule_warns(app):
+    @app.route("/duplicate/")
+    def first():
+        return "first"
+
+    with pytest.warns(UserWarning, match="'first'") as record:
+        app.add_url_rule("/duplicate/", endpoint="second", view_func=lambda: "second")
+
+    msg = str(record[0].message)
+    assert "'/duplicate/'" in msg
+    assert "'second'" in msg
+    assert "GET" in msg
+
+
+def test_duplicate_url_rule_partial_method_overlap(app):
+    @app.route("/duplicate/", methods=["GET", "POST"])
+    def first():
+        return "first"
+
+    with pytest.warns(UserWarning, match="POST"):
+        app.add_url_rule(
+            "/duplicate/",
+            methods=["POST", "PUT"],
+            endpoint="second",
+            view_func=lambda: "second",
+        )
+
+
+def test_duplicate_url_rule_disjoint_methods(app, client):
+    @app.get("/split-methods/")
+    def get_view():
+        return "get"
+
+    @app.post("/split-methods/")
+    def post_view():
+        return "post"
+
+    assert client.get("/split-methods/").data == b"get"
+    assert client.post("/split-methods/").data == b"post"
+
+
+def test_duplicate_url_rule_ignores_automatic_options(app):
+    # OPTIONS is added automatically to both rules, but that does not
+    # make their views shadow each other.
+    @app.route("/auto-options/", methods=["GET"])
+    def get_view():
+        return "get"
+
+    @app.route("/auto-options/", methods=["POST"])
+    def post_view():
+        return "post"
+
+    client = app.test_client()
+    assert client.get("/auto-options/").data == b"get"
+    assert client.post("/auto-options/").data == b"post"
+
+
+def test_duplicate_url_rule_explicit_options_overlap(app):
+    @app.route("/explicit-options/", methods=["GET", "OPTIONS"])
+    def first():
+        return "first"
+
+    with pytest.warns(UserWarning, match="OPTIONS"):
+        app.add_url_rule(
+            "/explicit-options/",
+            methods=["POST", "OPTIONS"],
+            endpoint="second",
+            view_func=lambda: "second",
+        )
+
+
+def test_duplicate_url_rule_same_endpoint(app, client):
+    # Stacking rules on the same endpoint is a legal alias, including the
+    # same rule string with different methods.
+    @app.route("/same-endpoint/", methods=["GET"])
+    @app.route("/same-endpoint/", methods=["POST"])
+    def same():
+        return "same"
+
+    assert client.get("/same-endpoint/").data == b"same"
+    assert client.post("/same-endpoint/").data == b"same"
+
+
+@pytest.mark.parametrize("value", ["ignore", False, None])
+def test_duplicate_url_rule_ignore(app, client, value):
+    app.config["DUPLICATE_URL_RULES"] = value
+
+    @app.route("/ignored/")
+    def first():
+        return "first"
+
+    app.add_url_rule("/ignored/", endpoint="second", view_func=lambda: "second")
+
+    assert ("/ignored/", None, None) not in app._registered_url_rules
+    assert client.get("/ignored/").data == b"first"
+
+
+def test_duplicate_url_rule_error(app):
+    app.config["DUPLICATE_URL_RULES"] = "error"
+
+    @app.route("/raising/")
+    def first():
+        return "first"
+
+    with pytest.raises(AssertionError, match="'first'") as exc_info:
+        app.add_url_rule("/raising/", endpoint="second", view_func=lambda: "second")
+
+    msg = str(exc_info.value)
+    assert "'/raising/'" in msg
+    assert "'second'" in msg
+    # Registration was aborted: nothing was added for the second endpoint.
+    assert "second" not in app.view_functions
+    assert "second" not in {r.endpoint for r in app.url_map.iter_rules()}
+
+
+def test_duplicate_url_rule_blueprints(app):
+    bp1 = flask.Blueprint("bp1", __name__)
+    bp2 = flask.Blueprint("bp2", __name__)
+
+    @bp1.route("/ping")
+    def ping1():
+        return "1"
+
+    @bp2.route("/ping")
+    def ping2():
+        return "2"
+
+    app.register_blueprint(bp1, url_prefix="/api")
+    with pytest.warns(UserWarning, match="/api/ping") as record:
+        app.register_blueprint(bp2, url_prefix="/api")
+
+    msg = str(record[0].message)
+    assert "'bp1.ping1'" in msg
+    assert "'bp2.ping2'" in msg
+    assert app.test_client().get("/api/ping").data == b"1"
+
+
+def test_duplicate_url_rule_different_subdomains():
+    app = flask.Flask(__name__, subdomain_matching=True)
+    app.config["SERVER_NAME"] = "example.test"
+
+    @app.route("/same/", subdomain="a")
+    def first():
+        return "a"
+
+    @app.route("/same/", subdomain="b")
+    def second():
+        return "b"
+
+    client = app.test_client()
+    assert client.get("http://a.example.test/same/").data == b"a"
+    assert client.get("http://b.example.test/same/").data == b"b"
+
+
+def test_duplicate_url_rule_different_hosts():
+    app = flask.Flask(__name__, host_matching=True, static_host="a.example.test")
+
+    @app.route("/same/", host="a.example.test")
+    def first():
+        return "a"
+
+    @app.route("/same/", host="b.example.test")
+    def second():
+        return "b"
+
+    client = app.test_client()
+    assert client.get("http://a.example.test/same/").data == b"a"
+    assert client.get("http://b.example.test/same/").data == b"b"
+
+
 def test_run_defaults(monkeypatch, app):
     rv = {}
 

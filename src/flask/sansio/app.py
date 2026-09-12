@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import typing as t
+import warnings
 from datetime import timedelta
 from itertools import chain
 
@@ -47,6 +48,10 @@ T_teardown = t.TypeVar("T_teardown", bound=ft.TeardownCallable)
 T_template_filter = t.TypeVar("T_template_filter", bound=ft.TemplateFilterCallable)
 T_template_global = t.TypeVar("T_template_global", bound=ft.TemplateGlobalCallable)
 T_template_test = t.TypeVar("T_template_test", bound=ft.TemplateTestCallable)
+
+#: Directory containing the Flask package, with a trailing path separator.
+#: Used to skip Flask's own frames when pointing a warning at user code.
+_FLASK_PACKAGE_DIR = os.path.dirname(os.path.dirname(__file__)) + os.sep
 
 
 def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
@@ -403,6 +408,15 @@ class App(Scaffold):
 
         self.subdomain_matching = subdomain_matching
 
+        #: Registered rules keyed by their final ``(rule, subdomain, host)``
+        #: identity, mapped to the endpoints that registered that rule and
+        #: the HTTP methods each endpoint handles. Used to detect duplicate
+        #: URL rules in :meth:`add_url_rule`.
+        self._registered_url_rules: dict[
+            tuple[str, str | None, str | None],
+            list[tuple[str, frozenset[str]]],
+        ] = {}
+
         # tracks internally if the application already handled at least one
         # request.
         self._got_first_request = False
@@ -641,14 +655,26 @@ class App(Scaffold):
                     and self.config["PROVIDE_AUTOMATIC_OPTIONS"]
                 )
 
+        # Methods handled by the view itself, used to detect duplicate
+        # rules. The automatic OPTIONS method Flask may add below is
+        # excluded, but an explicitly declared OPTIONS is kept. Werkzeug
+        # serves HEAD requests with GET rules, so HEAD is treated as
+        # covered by GET.
+        check_methods = frozenset(methods) | frozenset(required_methods)
+
         if provide_automatic_options:
             required_methods.add("OPTIONS")
+
+        if "GET" in check_methods:
+            check_methods |= {"HEAD"}
 
         # Add the required methods now.
         methods |= required_methods
 
         rule_obj = self.url_rule_class(rule, methods=methods, **options)
         rule_obj.provide_automatic_options = provide_automatic_options  # type: ignore[attr-defined]
+
+        self._check_duplicate_url_rule(rule_obj, endpoint, check_methods)
 
         self.url_map.add(rule_obj)
         if view_func is not None:
@@ -659,6 +685,97 @@ class App(Scaffold):
                     f" endpoint function: {endpoint}"
                 )
             self.view_functions[endpoint] = view_func
+
+    def _check_duplicate_url_rule(
+        self, rule: Rule, endpoint: str, methods: frozenset[str]
+    ) -> None:
+        """Check whether a different endpoint has already registered the
+        same final URL rule with overlapping HTTP methods.
+
+        :param methods: The HTTP methods handled by the view, without the
+            OPTIONS method that Flask adds automatically.
+        :param endpoint: The endpoint registering ``rule``.
+        :param rule: The fully constructed rule, with its final rule
+            string including any blueprint URL prefix.
+
+        The :data:`DUPLICATE_URL_RULES` config controls what happens:
+        ``"warn"`` (the default) emits a :class:`UserWarning`, ``"error"``
+        raises an :exc:`AssertionError`, and ``"ignore"`` disables the
+        check completely. Rules registered for the same endpoint (route
+        decorator stacking) are always allowed.
+        """
+        policy = self.config["DUPLICATE_URL_RULES"]
+
+        if isinstance(policy, str):
+            policy = policy.lower()
+
+        # Disabled: don't track anything, so behavior and performance are
+        # identical to registering without the check.
+        if policy is False or policy is None or policy == "ignore":
+            return
+
+        key = (rule.rule, rule.subdomain, rule.host)
+        existing = self._registered_url_rules.setdefault(key, [])
+
+        for other_endpoint, other_methods in existing:
+            if other_endpoint == endpoint:
+                # Multiple rules stacked on the same endpoint are legal.
+                continue
+
+            overlap = methods & other_methods
+
+            if not overlap:
+                continue
+
+            if rule.host is not None:
+                scope = f" on host {rule.host!r}"
+            elif rule.subdomain is not None:
+                scope = f" on subdomain {rule.subdomain!r}"
+            else:
+                scope = ""
+
+            methods_msg = f"HTTP method(s) {', '.join(sorted(overlap))}"
+
+            msg = (
+                f"URL rule {rule.rule!r}{scope} is already registered for"
+                f" endpoint {other_endpoint!r}. Endpoint {endpoint!r}"
+                f" also handles {methods_msg} for that rule, but the rule"
+                f" registered first for {other_endpoint!r} matches those"
+                " requests, so this view function will never run for"
+                " them. Set the DUPLICATE_URL_RULES config to 'error' to"
+                " raise an exception or 'ignore' to disable this check."
+            )
+
+            if policy == "error" or policy == "raise":
+                raise AssertionError(msg)
+
+            # Point the warning at the registration call in user code
+            # instead of a frame inside Flask. Blueprint registrations
+            # only reach add_url_rule through deferred functions, so walk
+            # past all frames within the Flask package.
+            frame = sys._getframe()
+            stacklevel = 1
+
+            while frame is not None and frame.f_code.co_filename.startswith(
+                _FLASK_PACKAGE_DIR
+            ):
+                frame = frame.f_back
+                stacklevel += 1
+
+            warnings.warn(
+                msg,
+                UserWarning,
+                stacklevel=stacklevel if frame is not None else 2,
+            )
+
+        # Record this endpoint. Multiple registrations on the same endpoint
+        # share one entry, with the handled methods merged together.
+        for i, (other_endpoint, other_methods) in enumerate(existing):
+            if other_endpoint == endpoint:
+                existing[i] = (endpoint, other_methods | methods)
+                return
+
+        existing.append((endpoint, methods))
 
     @t.overload
     def template_filter(self, name: T_template_filter) -> T_template_filter: ...
