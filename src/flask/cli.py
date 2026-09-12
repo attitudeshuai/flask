@@ -978,6 +978,13 @@ def run_command(
     if debugger is None:
         debugger = debug
 
+    # Validate the response cache configuration before serving so invalid
+    # values fail before the first request.
+    from .app import Flask
+
+    if isinstance(app, Flask):
+        app.init_response_cache()
+
     show_server_banner(debug, info.app_import_path)
 
     run_simple(
@@ -1105,6 +1112,59 @@ def routes_command(sort: str, all_methods: bool) -> None:
 
     for row in rows:
         click.echo(template.format(*row))
+
+
+@click.group("response-cache", short_help="Manage the response cache.")
+def response_cache_command() -> None:
+    """Inspect and clear the application's response cache."""
+
+
+@response_cache_command.command("clear")
+@click.option(
+    "--endpoint",
+    default=None,
+    help="Only clear entries cached for this endpoint.",
+)
+@click.option(
+    "--prefix",
+    default=None,
+    help="Only clear entries whose request path starts with this prefix.",
+)
+@with_appcontext
+def response_cache_clear_command(
+    endpoint: str | None, prefix: str | None
+) -> None:
+    """Clear cached responses, optionally filtered by endpoint or path."""
+    app = current_app._get_current_object()
+
+    if app.response_cache is None:
+        click.echo(
+            "Response cache is disabled. Set 'RESPONSE_CACHE_ENABLED' to"
+            " True to enable it."
+        )
+        return
+
+    count = app.clear_response_cache(endpoint=endpoint, prefix=prefix)
+    click.echo(f"Removed {count} cached response{'s' if count != 1 else ''}.")
+
+
+@response_cache_command.command("stats")
+@with_appcontext
+def response_cache_stats_command() -> None:
+    """Show response cache hit and miss statistics."""
+    app = current_app._get_current_object()
+
+    if app.response_cache is None:
+        click.echo(
+            "Response cache is disabled. Set 'RESPONSE_CACHE_ENABLED' to"
+            " True to enable it."
+        )
+        return
+
+    stats = app.get_response_cache_stats()
+    click.echo(f"hits:       {stats['hits']}")
+    click.echo(f"misses:     {stats['misses']}")
+    click.echo(f"entries:    {stats['entries']}/{stats['max_entries']}")
 
 
 cli = FlaskGroup(

@@ -42,6 +42,7 @@ from .helpers import get_debug_flag
 from .helpers import get_flashed_messages
 from .helpers import get_load_dotenv
 from .helpers import send_from_directory
+from .response_cache import ResponseCache
 from .sansio.app import App
 from .sessions import SecureCookieSessionInterface
 from .sessions import SessionInterface
@@ -235,6 +236,16 @@ class Flask(App):
             "TEMPLATES_AUTO_RELOAD": None,
             "MAX_COOKIE_SIZE": 4093,
             "PROVIDE_AUTOMATIC_OPTIONS": True,
+            "RESPONSE_CACHE_ENABLED": False,
+            "RESPONSE_CACHE_TTL": 300,
+            "RESPONSE_CACHE_MAX_ENTRIES": 512,
+            "RESPONSE_CACHE_METHODS": ("GET", "HEAD"),
+            "RESPONSE_CACHE_HEADERS": (),
+            "RESPONSE_CACHE_ENDPOINTS": None,
+            "RESPONSE_CACHE_EXCLUDE_ENDPOINTS": ("static",),
+            "RESPONSE_CACHE_PATHS": None,
+            "RESPONSE_CACHE_EXCLUDE_PATHS": (),
+            "RESPONSE_CACHE_STATUS_CODES": frozenset(range(200, 300)),
         }
     )
 
@@ -344,6 +355,13 @@ class Flask(App):
         # the app's commands to another CLI tool.
         self.cli.name = self.name
 
+        self.cli.add_command(cli.response_cache_command)
+
+        #: The active response cache, or None if the cache is disabled or
+        #: has not been initialized yet.
+        self._response_cache: ResponseCache | None = None
+        self._response_cache_loaded = False
+
         # Add a static route using the provided static_url_path, static_host,
         # and static_folder if there is a configured static_folder.
         # Note we do this without checking if static_folder exists.
@@ -362,6 +380,71 @@ class Flask(App):
                 host=static_host,
                 view_func=lambda **kw: self_ref().send_static_file(**kw),  # type: ignore
             )
+
+    @property
+    def response_cache(self) -> ResponseCache | None:
+        """The active :class:`~flask.ResponseCache`, or ``None`` if the
+        response cache is disabled. Call :meth:`init_response_cache` to
+        create it from the current configuration.
+        """
+        return self._response_cache
+
+    def init_response_cache(self) -> ResponseCache | None:
+        """Create the response cache from the current ``RESPONSE_CACHE_*``
+        configuration. This validates the configuration and raises
+        :exc:`ValueError` if any value is invalid, so it can be called
+        before serving requests to fail early. It is also called
+        automatically the first time a request is handled. Calling it
+        again replaces and resets the cache.
+        """
+        if self.config["RESPONSE_CACHE_ENABLED"]:
+            self._response_cache = ResponseCache(self)
+        else:
+            self._response_cache = None
+
+        self._response_cache_loaded = True
+        return self._response_cache
+
+    def _get_response_cache(self) -> ResponseCache | None:
+        if not self._response_cache_loaded:
+            return self.init_response_cache()
+
+        return self._response_cache
+
+    def clear_response_cache(
+        self, endpoint: str | None = None, prefix: str | None = None
+    ) -> int:
+        """Clear cached responses, optionally only those cached for
+        ``endpoint`` or whose request path starts with ``prefix``. Returns
+        the number of removed entries. Requires the response cache to be
+        enabled.
+
+        :param endpoint: Only remove entries for this endpoint name.
+        :param prefix: Only remove entries whose path starts with this
+            prefix.
+        """
+        if self._response_cache is None:
+            raise RuntimeError(
+                "The response cache is not enabled. Set"
+                " 'RESPONSE_CACHE_ENABLED' to True and initialize the app"
+                " to use 'clear_response_cache'."
+            )
+
+        return self._response_cache.clear(endpoint=endpoint, prefix=prefix)
+
+    def get_response_cache_stats(self) -> dict[str, int]:
+        """Return a dict with the number of cache ``hits`` and ``misses``
+        and the current number of cached ``entries``. Requires the
+        response cache to be enabled.
+        """
+        if self._response_cache is None:
+            raise RuntimeError(
+                "The response cache is not enabled. Set"
+                " 'RESPONSE_CACHE_ENABLED' to True and initialize the app"
+                " to use 'get_response_cache_stats'."
+            )
+
+        return self._response_cache.stats()
 
     def get_send_file_max_age(self, filename: str | None) -> int | None:
         """Used by :func:`send_file` to determine the ``max_age`` cache
@@ -743,6 +826,10 @@ class Flask(App):
         options.setdefault("use_debugger", self.debug)
         options.setdefault("threaded", True)
 
+        # Validate and initialize the response cache before serving so
+        # invalid configuration fails before the first request.
+        self.init_response_cache()
+
         cli.show_server_banner(self.debug, self.name)
 
         from werkzeug.serving import run_simple
@@ -1012,14 +1099,36 @@ class Flask(App):
 
         self._got_first_request = True
 
+        cache = self._get_response_cache()
+        flight = None
+
         try:
-            request_started.send(self, _async_wrapper=self.ensure_sync)
-            rv = self.preprocess_request(ctx)
-            if rv is None:
-                rv = self.dispatch_request(ctx)
-        except Exception as e:
-            rv = self.handle_user_exception(ctx, e)
-        return self.finalize_request(ctx, rv)
+            try:
+                request_started.send(self, _async_wrapper=self.ensure_sync)
+                rv = self.preprocess_request(ctx)
+
+                if rv is None and cache is not None:
+                    # Returns a cached response, a flight to lead on a miss,
+                    # or (None, None) when the request is not eligible.
+                    rv, flight = cache.acquire(ctx)
+
+                if rv is None:
+                    rv = self.dispatch_request(ctx)
+            except Exception as e:
+                rv = self.handle_user_exception(ctx, e)
+
+            response = self.finalize_request(ctx, rv)
+
+            if flight is not None and cache is not None:
+                cache.commit(flight, ctx, response)
+
+            return response
+        finally:
+            # Make sure concurrent requests waiting on this request are
+            # released even if finalization failed or the exception was
+            # re-raised by error handling.
+            if flight is not None and not flight.event.is_set() and cache is not None:
+                cache.abort(flight)
 
     def finalize_request(
         self,
