@@ -214,6 +214,21 @@ class Scaffold:
             ft.AppOrBlueprintKey, list[ft.URLDefaultCallable]
         ] = defaultdict(list)
 
+        #: A log of every error handler registration made on this
+        #: scaffold, in registration order. Each entry is a dict with
+        #: the keys ``"sequence"`` (0-based registration index on this
+        #: scaffold), ``"code"`` (HTTP status code or ``None``),
+        #: ``"exception_class"``, ``"func"``, and
+        #: ``"origin_blueprint"`` (set when a blueprint registers an
+        #: app-wide handler). Used to report handlers that were
+        #: overwritten by a later registration for the same key, which
+        #: can no longer be reconstructed from
+        #: :attr:`error_handler_spec` alone.
+        #:
+        #: This data structure is internal. It should not be modified
+        #: directly and its format may change at any time.
+        self._error_handler_registrations: list[dict[str, t.Any]] = []
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r}>"
 
@@ -651,6 +666,8 @@ class Scaffold:
         self,
         code_or_exception: type[Exception] | int,
         f: ft.ErrorHandlerCallable,
+        *,
+        _origin_blueprint: str | None = None,
     ) -> None:
         """Alternative error attach function to the :meth:`errorhandler`
         decorator that is more straightforward to use for non decorator
@@ -659,6 +676,15 @@ class Scaffold:
         .. versionadded:: 0.7
         """
         exc_class, code = self._get_exc_class_and_code(code_or_exception)
+        self._error_handler_registrations.append(
+            {
+                "sequence": len(self._error_handler_registrations),
+                "code": code,
+                "exception_class": exc_class,
+                "func": f,
+                "origin_blueprint": _origin_blueprint,
+            }
+        )
         self.error_handler_spec[None][code][exc_class] = f
 
     @staticmethod

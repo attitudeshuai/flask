@@ -58,6 +58,7 @@ if t.TYPE_CHECKING:  # pragma: no cover
     from _typeshed.wsgi import StartResponse
     from _typeshed.wsgi import WSGIEnvironment
 
+    from .rehearsal import RequestRehearsal
     from .testing import FlaskClient
     from .testing import FlaskCliRunner
     from .typing import HeadersValue
@@ -1565,6 +1566,67 @@ class Flask(App):
             builder.close()
 
         return self.request_context(environ)
+
+    def rehearse_request(
+        self,
+        method: str = "GET",
+        path: str = "/",
+        *,
+        headers: t.Any = None,
+        host: str | None = None,
+        subdomain: str | None = None,
+        base_url: str | None = None,
+        url_scheme: str | None = None,
+        error: type[Exception] | Exception | int | None = None,
+    ) -> RequestRehearsal:
+        """Rehearse the request handling chain without executing it.
+
+        Given a request's method, path, host or subdomain, and optional
+        headers, report the complete chain that a real request would
+        follow: the matched rule and endpoint (or why matching failed),
+        the URL value preprocessors, ``before_request`` functions, the
+        view, ``after_request`` functions (in their reversed order),
+        ``teardown_request`` functions, and the error handler lookup
+        order. Each item identifies whether it was registered on the
+        application or on a blueprint, and its registration index in
+        that scope. Registrations that do not apply to the request's
+        scope are listed separately, and error handlers replaced by a
+        later same-key registration are reported as never effective.
+
+        The view and all callbacks, signals, sessions and teardowns are
+        skipped; nothing is pushed or dispatched and no application
+        state changes. The returned
+        :class:`~flask.rehearsal.RequestRehearsal` provides a stable
+        machine readable report and a human readable rendering.
+
+        :param method: HTTP method, defaults to ``"GET"``.
+        :param path: Request path, possibly with a query string.
+        :param headers: Optional request headers as a mapping or an
+            iterable of ``(name, value)`` pairs.
+        :param host: Explicit ``Host`` header value.
+        :param subdomain: Subdomain prepended to :data:`SERVER_NAME`.
+        :param base_url: Complete base URL, as taken by the test client.
+        :param url_scheme: Scheme used when constructing the base URL.
+        :param error: Exception class, exception instance, or HTTP
+            status code to resolve the error handler lookup for.
+            Defaults to the routing error, or ``500`` for a matched
+            request.
+
+        .. versionadded:: 3.2
+        """
+        from .rehearsal import rehearse_request
+
+        return rehearse_request(
+            self,
+            method=method,
+            path=path,
+            headers=headers,
+            host=host,
+            subdomain=subdomain,
+            base_url=base_url,
+            url_scheme=url_scheme,
+            error=error,
+        )
 
     def wsgi_app(
         self, environ: WSGIEnvironment, start_response: StartResponse

@@ -373,6 +373,24 @@ class App(Scaffold):
         #: .. versionadded:: 0.7
         self.blueprints: dict[str, Blueprint] = {}
 
+        #: Provenance of callbacks that a blueprint registers in the
+        #: application-wide (``None``) scope through the
+        #: ``before_app_request``, ``after_app_request``,
+        #: ``teardown_app_request`` and
+        #: ``app_url_value_preprocessor`` decorators. Maps the
+        #: blueprint name used at registration time to a dict mapping
+        #: callback kind to the functions, in registration order. This
+        #: is the only way to attribute those callbacks after they were
+        #: appended to the application's own lists. It is only written
+        #: while blueprints are registered and only read by the request
+        #: rehearsal feature, so it has no per-request cost.
+        #:
+        #: This data structure is internal. It should not be modified
+        #: directly and its format may change at any time.
+        self._blueprint_app_callbacks: dict[
+            str, dict[str, list[t.Callable[..., t.Any]]]
+        ] = {}
+
         #: a place where extensions can store application specific state.  For
         #: example this is where an extension could store database engines and
         #: similar things.
@@ -600,6 +618,20 @@ class App(Scaffold):
         .. versionadded:: 0.11
         """
         return self.blueprints.values()
+
+    def _record_blueprint_app_callback(
+        self, blueprint_name: str, kind: str, func: t.Callable[..., t.Any]
+    ) -> None:
+        """Record that ``func`` was added to the application-wide scope
+        by a blueprint's ``*_app_*`` decorator. Called while registering
+        blueprints; only used by the request rehearsal feature.
+
+        :meta private:
+        :internal:
+        """
+        self._blueprint_app_callbacks.setdefault(blueprint_name, {}).setdefault(
+            kind, []
+        ).append(func)
 
     @setupmethod
     def add_url_rule(

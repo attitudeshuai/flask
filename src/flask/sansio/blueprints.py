@@ -615,9 +615,12 @@ class Blueprint(Scaffold):
         """Like :meth:`before_request`, but before every request, not only those handled
         by the blueprint. Equivalent to :meth:`.Flask.before_request`.
         """
-        self.record_once(
-            lambda s: s.app.before_request_funcs.setdefault(None, []).append(f)
-        )
+
+        def register(state: BlueprintSetupState) -> None:
+            state.app.before_request_funcs.setdefault(None, []).append(f)
+            state.app._record_blueprint_app_callback(state.name, "before_request", f)
+
+        self.record_once(register)
         return f
 
     @setupmethod
@@ -625,9 +628,12 @@ class Blueprint(Scaffold):
         """Like :meth:`after_request`, but after every request, not only those handled
         by the blueprint. Equivalent to :meth:`.Flask.after_request`.
         """
-        self.record_once(
-            lambda s: s.app.after_request_funcs.setdefault(None, []).append(f)
-        )
+
+        def register(state: BlueprintSetupState) -> None:
+            state.app.after_request_funcs.setdefault(None, []).append(f)
+            state.app._record_blueprint_app_callback(state.name, "after_request", f)
+
+        self.record_once(register)
         return f
 
     @setupmethod
@@ -635,9 +641,14 @@ class Blueprint(Scaffold):
         """Like :meth:`teardown_request`, but after every request, not only those
         handled by the blueprint. Equivalent to :meth:`.Flask.teardown_request`.
         """
-        self.record_once(
-            lambda s: s.app.teardown_request_funcs.setdefault(None, []).append(f)
-        )
+
+        def register(state: BlueprintSetupState) -> None:
+            state.app.teardown_request_funcs.setdefault(None, []).append(f)
+            state.app._record_blueprint_app_callback(
+                state.name, "teardown_request", f
+            )
+
+        self.record_once(register)
         return f
 
     @setupmethod
@@ -662,7 +673,9 @@ class Blueprint(Scaffold):
 
         def decorator(f: T_error_handler) -> T_error_handler:
             def from_blueprint(state: BlueprintSetupState) -> None:
-                state.app.errorhandler(code)(f)
+                state.app.register_error_handler(
+                    code, f, _origin_blueprint=state.name
+                )
 
             self.record_once(from_blueprint)
             return f
@@ -676,9 +689,14 @@ class Blueprint(Scaffold):
         """Like :meth:`url_value_preprocessor`, but for every request, not only those
         handled by the blueprint. Equivalent to :meth:`.Flask.url_value_preprocessor`.
         """
-        self.record_once(
-            lambda s: s.app.url_value_preprocessors.setdefault(None, []).append(f)
-        )
+
+        def register(state: BlueprintSetupState) -> None:
+            state.app.url_value_preprocessors.setdefault(None, []).append(f)
+            state.app._record_blueprint_app_callback(
+                state.name, "url_value_preprocessor", f
+            )
+
+        self.record_once(register)
         return f
 
     @setupmethod

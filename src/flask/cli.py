@@ -594,6 +594,7 @@ class FlaskGroup(AppGroup):
             self.add_command(run_command)
             self.add_command(shell_command)
             self.add_command(routes_command)
+            self.add_command(rehearse_command)
 
         self._loaded_plugin_commands = False
 
@@ -1105,6 +1106,89 @@ def routes_command(sort: str, all_methods: bool) -> None:
 
     for row in rows:
         click.echo(template.format(*row))
+
+
+@click.command("rehearse", short_help="Rehearse the request handling chain.")
+@click.argument("path")
+@click.option(
+    "-m",
+    "--method",
+    default="GET",
+    show_default=True,
+    help="HTTP method to rehearse.",
+)
+@click.option("--host", help="Host name to rehearse, sets the Host header.")
+@click.option("--subdomain", help="Subdomain to prepend to SERVER_NAME.")
+@click.option(
+    "-H",
+    "--header",
+    "headers",
+    multiple=True,
+    metavar="NAME:VALUE",
+    help="Request header, may be given multiple times.",
+)
+@click.option(
+    "--error",
+    "error",
+    default=None,
+    help=(
+        "Resolve error handler lookup for an HTTP status code or a dotted"
+        " exception class such as 'werkzeug.exceptions:NotFound'."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print the stable machine readable report as JSON.",
+)
+@with_appcontext
+def rehearse_command(
+    path: str,
+    method: str,
+    host: str | None,
+    subdomain: str | None,
+    headers: tuple[str, ...],
+    error: str | None,
+    as_json: bool,
+) -> None:
+    """Rehearse which rule, callbacks and error handlers a request would
+    reach, without executing the view or any callbacks.
+
+    PATH is the request path, optionally including a query string.
+    """
+    parsed_headers: list[tuple[str, str]] = []
+
+    for header in headers:
+        if ":" not in header:
+            raise click.BadParameter(
+                f"Header {header!r} must be in 'NAME:VALUE' format."
+            )
+
+        name, value = header.split(":", 1)
+        parsed_headers.append((name.strip(), value.strip()))
+
+    parsed_error: type[Exception] | int | None = None
+
+    if error is not None:
+        if error.lstrip("-").isdigit():
+            parsed_error = int(error)
+        else:
+            parsed_error = t.cast("type[Exception]", import_string(error))
+
+    report = current_app.rehearse_request(
+        method=method,
+        path=path,
+        headers=parsed_headers,
+        host=host,
+        subdomain=subdomain,
+        error=parsed_error,
+    )
+
+    if as_json:
+        click.echo(report.to_json())
+    else:
+        click.echo(report.to_text())
 
 
 cli = FlaskGroup(

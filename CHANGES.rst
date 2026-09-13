@@ -30,6 +30,14 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   Add request chain rehearsal: ``app.rehearse_request()`` and the
+    ``flask rehearse`` command report the matched rule, URL value
+    preprocessors, ``before_request`` and view, ``after_request`` and
+    ``teardown_request`` callbacks, and error handler lookup order for a
+    request, with the registration source and index of each item,
+    without executing the view, callbacks, signals or other side
+    effects. Inactive scopes and overwritten error handlers are listed
+    separately. Output is available as stable JSON in addition to text.
 
 
 Version 3.1.3
