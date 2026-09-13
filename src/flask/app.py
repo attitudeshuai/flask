@@ -20,6 +20,7 @@ from werkzeug.datastructures import ImmutableDict
 from werkzeug.exceptions import BadRequestKeyError
 from werkzeug.exceptions import HTTPException
 from werkzeug.exceptions import InternalServerError
+from werkzeug.exceptions import NotAcceptable
 from werkzeug.routing import BuildError
 from werkzeug.routing import MapAdapter
 from werkzeug.routing import RequestRedirect
@@ -42,6 +43,9 @@ from .helpers import get_debug_flag
 from .helpers import get_flashed_messages
 from .helpers import get_load_dotenv
 from .helpers import send_from_directory
+from .negotiation import Representation
+from .negotiation import RepresentationMap
+from .negotiation import REPRESENTATIONS_ATTR
 from .sansio.app import App
 from .sessions import SecureCookieSessionInterface
 from .sessions import SessionInterface
@@ -105,6 +109,24 @@ def add_ctx(f: F) -> F:
         return f(self, *args, **kwargs)
 
     return update_wrapper(wrapper, f)  # type: ignore[return-value]
+
+
+class _NegotiatedResponse:
+    """Headers to apply to a response produced through representation
+    negotiation. Created per request, so no shared mutable state is used
+    while negotiating.
+
+    :param representation: The selected representation, or ``None`` for a
+        406 response routed through error handling.
+    :param vary: Whether to declare that the response varies on the
+        ``Accept`` header.
+    """
+
+    __slots__ = ("representation", "vary")
+
+    def __init__(self, representation: Representation | None, vary: bool) -> None:
+        self.representation = representation
+        self.vary = vary
 
 
 class Flask(App):
@@ -1039,7 +1061,12 @@ class Flask(App):
 
         :internal:
         """
+        rv, negotiated = self._negotiate_representation(ctx, rv, from_error_handler)
         response = self.make_response(rv)
+
+        if negotiated is not None:
+            self._apply_negotiated_headers(response, negotiated)
+
         try:
             response = self.process_response(ctx, response)
             request_finished.send(
@@ -1052,6 +1079,192 @@ class Flask(App):
                 "Request finalizing failed with an error while handling an error"
             )
         return response
+
+    @staticmethod
+    def _is_explicit_return(rv: t.Any) -> bool:
+        """Check whether a view's return value is already a fully formed
+        response rather than a resource passed to a representation
+        generator. Mirrors the cases :meth:`make_response` turns into a
+        response directly: response objects, streaming iterators, and
+        WSGI callables.
+        """
+        return (
+            isinstance(rv, BaseResponse)
+            or isinstance(rv, cabc.Iterator)
+            or callable(rv)
+        )
+
+    def _find_representation_map(self, ctx: AppContext) -> RepresentationMap | None:
+        """Find the representations offered by the current request's
+        endpoint, in precedence order: the endpoint itself (per HTTP
+        method for class-based views), the handling blueprints from most
+        to least specific, then the application.
+        """
+        req = ctx.request
+        endpoint = req.endpoint
+
+        if endpoint is not None:
+            view_func = self.view_functions.get(endpoint)
+
+            if view_func is not None:
+                declared = getattr(view_func, REPRESENTATIONS_ATTR, None)
+
+                if isinstance(declared, dict):
+                    per_method = declared
+                    declared = per_method.get(req.method)
+
+                    # HEAD falls back to the GET method's declarations.
+                    if declared is None and req.method == "HEAD":
+                        declared = per_method.get("GET")
+
+                if declared is not None:
+                    return t.cast(RepresentationMap, declared)
+
+            # ``req.blueprints`` is ordered from the innermost blueprint
+            # name outward, so the first match is the most specific.
+            for name in req.blueprints:
+                representation_map = self.representation_specs.get(name)
+
+                if representation_map is not None:
+                    return representation_map
+
+        return self.representation_map
+
+    def _not_acceptable(
+        self, ctx: AppContext, representation_map: RepresentationMap
+    ) -> tuple[ft.ResponseReturnValue | HTTPException, _NegotiatedResponse]:
+        """Build the 406 result for a request whose ``Accept`` preferences
+        don't include any offered representation. The exception is routed
+        through the standard error handler chain, so a custom 406 handler
+        keeps the usual precedence. No representation generator runs.
+        """
+        available = ", ".join(representation_map.content_types)
+        error = NotAcceptable(
+            description=(
+                "The resource can only generate representations with"
+                " content characteristics not acceptable according to the"
+                " request's Accept header. Available representations:"
+                f" {available}."
+            )
+        )
+        error.available_representations = representation_map  # type: ignore[attr-defined]
+        handled = self.handle_user_exception(ctx, error)
+        # An explicit response from a custom error handler is passed
+        # through unchanged; otherwise mark cache variability.
+        negotiated = _NegotiatedResponse(None, not isinstance(handled, BaseResponse))
+        return handled, negotiated
+
+    def _negotiate_representation(
+        self,
+        ctx: AppContext,
+        rv: ft.ResponseReturnValue | HTTPException,
+        from_error_handler: bool,
+    ) -> tuple[ft.ResponseReturnValue | HTTPException, _NegotiatedResponse | None]:
+        """Transform a view or error handler return value through the
+        endpoint's declared representations.
+
+        Returns ``rv`` unchanged when there is nothing to negotiate or
+        when the view returned an explicit response, streaming iterator,
+        or WSGI callable. Otherwise selects a representation from the
+        request's ``Accept`` header, calls its generator with the
+        returned resource, and returns instructions for setting the
+        content type and ``Vary`` header.
+        """
+        representation_map = self._find_representation_map(ctx)
+
+        if representation_map is None:
+            return rv, None
+
+        status: int | str | None = None
+        headers: ft.HeadersValue | None = None
+        body: t.Any = rv
+
+        # Unpack a (body[, status[, headers]]) tuple the same way
+        # make_response does, so the generator receives just the body.
+        if isinstance(body, tuple):
+            tuple_len = len(body)
+
+            if tuple_len == 3:
+                body, status, headers = body
+            elif tuple_len == 2:
+                if isinstance(body[1], (Headers, dict, tuple, list)):
+                    body, headers = body
+                else:
+                    body, status = body
+            else:
+                # Let make_response raise the usual invalid tuple error.
+                return rv, None
+
+        # An explicit response (including streaming and file responses)
+        # or an HTTP exception is never re-selected or rewritten.
+        if body is None or self._is_explicit_return(body):
+            return rv, None
+
+        representation = representation_map.select(ctx.request.accept_mimetypes)
+
+        if representation is None:
+            if from_error_handler:
+                # Don't replace an error response with 406 while another
+                # error is already being handled.
+                representation = representation_map.default
+            else:
+                return self._not_acceptable(ctx, representation_map)
+
+        try:
+            generated = self.ensure_sync(representation.func)(body)
+        except Exception as e:
+            if from_error_handler:
+                raise
+
+            # Route generator failures through normal error handling. The
+            # error handler's return value is converted normally without
+            # calling any generator again, but still varies on Accept.
+            handled = self.handle_user_exception(ctx, e)
+            negotiated = _NegotiatedResponse(
+                None, not isinstance(handled, BaseResponse)
+            )
+            return handled, negotiated
+
+        # Reattach the view's status and headers around the generated value.
+        if status is not None or headers is not None:
+            packed: list[t.Any] = [generated]
+
+            if status is not None:
+                packed.append(status)
+
+            if headers is not None:
+                packed.append(headers)
+
+            generated = tuple(packed)
+
+        return generated, _NegotiatedResponse(representation, True)
+
+    def _apply_negotiated_headers(
+        self, response: Response, negotiated: _NegotiatedResponse
+    ) -> None:
+        """Set the content type of a negotiated response to match its
+        representation, and declare variability on the Accept header.
+        """
+        representation = negotiated.representation
+
+        if representation is not None:
+            current_type = (response.mimetype or "").lower()
+
+            if current_type != representation.essence:
+                if ";" in representation.content_type:
+                    response.headers["Content-Type"] = representation.content_type
+                elif params := response.mimetype_params:
+                    parameters = "; ".join(
+                        f"{name}={value}" for name, value in params.items()
+                    )
+                    response.headers["Content-Type"] = (
+                        f"{representation.essence}; {parameters}"
+                    )
+                else:
+                    response.headers["Content-Type"] = representation.essence
+
+        if negotiated.vary:
+            response.vary.add("Accept")
 
     def make_default_options_response(self, ctx: AppContext) -> Response:
         """This method is called to create the default ``OPTIONS`` response.

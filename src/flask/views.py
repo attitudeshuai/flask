@@ -5,6 +5,8 @@ import typing as t
 from . import typing as ft
 from .globals import current_app
 from .globals import request
+from .negotiation import RepresentationMap
+from .negotiation import REPRESENTATIONS_ATTR
 
 F = t.TypeVar("F", bound=t.Callable[..., t.Any])
 
@@ -132,6 +134,36 @@ class View:
         view.__module__ = cls.__module__
         view.methods = cls.methods  # type: ignore
         view.provide_automatic_options = cls.provide_automatic_options  # type: ignore
+
+        # Collect representation declarations. Individual HTTP methods
+        # (typically on a MethodView) may each declare their own set;
+        # otherwise a declaration on dispatch_request applies to the
+        # whole view.
+        per_method: dict[str, RepresentationMap] = {}
+
+        for method_name in http_method_funcs:
+            method = getattr(cls, method_name, None)
+
+            if method is not None:
+                representation_map = getattr(method, REPRESENTATIONS_ATTR, None)
+
+                if representation_map is not None:
+                    per_method[method_name.upper()] = representation_map
+
+        if per_method:
+            # HEAD requests fall back to GET when there's no HEAD method.
+            if "GET" in per_method and "HEAD" not in per_method:
+                per_method["HEAD"] = per_method["GET"]
+
+            setattr(view, REPRESENTATIONS_ATTR, per_method)
+        else:
+            representation_map = getattr(
+                cls.dispatch_request, REPRESENTATIONS_ATTR, None
+            )
+
+            if representation_map is not None:
+                setattr(view, REPRESENTATIONS_ATTR, representation_map)
+
         return view
 
 

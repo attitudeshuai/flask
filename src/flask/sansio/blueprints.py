@@ -399,6 +399,9 @@ class Blueprint(Scaffold):
         for endpoint, func in self.view_functions.items():
             app.view_functions[endpoint] = func
 
+        if self.representation_map is not None:
+            app.representation_specs[name] = self.representation_map
+
         extend(self.before_request_funcs, app.before_request_funcs)
         extend(self.after_request_funcs, app.after_request_funcs)
         extend(

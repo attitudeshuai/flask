@@ -85,3 +85,7 @@ RouteCallable = (
     t.Callable[..., ResponseReturnValue]
     | t.Callable[..., t.Awaitable[ResponseReturnValue]]
 )
+RepresentationGeneratorCallable = (
+    t.Callable[[t.Any], ResponseReturnValue]
+    | t.Callable[[t.Any], t.Awaitable[ResponseReturnValue]]
+)

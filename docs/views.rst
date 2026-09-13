@@ -322,3 +322,103 @@ URL               Method     Description
 ``/stories/<id>`` ``PATCH``  Update a story
 ``/stories/<id>`` ``DELETE`` Delete a story
 ================= ========== ===================
+
+
+Representation Negotiation
+---------------------------
+
+By default, a view's return value determines the response: a string
+becomes HTML, a dict or list becomes JSON, and so on. Representation
+negotiation lets one endpoint offer multiple response formats instead.
+The framework selects the most appropriate one based on the request's
+``Accept`` header and its quality factors (``q``). It is opt-in per view;
+views that do not declare any representations keep their existing
+behavior exactly.
+
+A view performs any work shared between formats and returns the
+resource. Each :class:`~flask.Representation` pairs a content type with a
+generator that receives that resource and produces the response. The
+:func:`~flask.representations` decorator marks the view with the
+representations it offers. The first one declared is the default, used
+when the request has no ``Accept`` header.
+
+.. code-block:: python
+
+    from flask import Representation, jsonify, representations, render_template
+
+    def as_json(resource):
+        return jsonify(resource)
+
+    def as_html(resource):
+        return render_template("resource.html", resource=resource)
+
+    @app.route("/resource/<int:id>")
+    @representations(
+        Representation("application/json", as_json),
+        Representation("text/html", as_html),
+    )
+    def resource(id):
+        return db.get_resource(id)
+
+A request with ``Accept: application/json`` gets the JSON response,
+``Accept: text/html`` gets the HTML response. Quality factors decide the
+order (``text/html;q=0.9, application/json``), a quality of ``0``
+excludes a type, and a wildcard such as ``*/*`` or ``text/*``
+stably selects the earliest matching declaration. Every negotiated
+response gets a ``Vary: Accept`` header so caches do not serve one
+client's representation to another.
+
+If none of the offered representations is acceptable, the response is
+``406 Not Acceptable`` and its body lists the available content types.
+No representation generator is called in that case.
+
+Returning an explicit response object bypasses selection entirely; the
+given response, including its content type, is used unchanged. This also
+applies to streaming responses and :func:`~flask.send_file` responses.
+
+.. code-block:: python
+
+    @app.route("/resource/<int:id>/report")
+    @representations(
+        Representation("application/json", as_json),
+        Representation("text/html", as_html),
+    )
+    def resource_report(id):
+        if not session.get("can_download"):
+            # This response is used as-is, without negotiating.
+            return Response("Forbidden", status=403)
+        return db.get_resource(id)
+
+Representations can also be declared on the individual methods of a
+:class:`~flask.views.MethodView`:
+
+.. code-block:: python
+
+    class ResourceAPI(MethodView):
+        @representations(
+            Representation("application/json", as_json),
+            Representation("text/html", as_html),
+        )
+        def get(self, id):
+            return db.get_resource(id)
+
+        @representations(Representation("application/json", as_json))
+        def post(self):
+            return create_resource(request.json)
+
+Defaults can be registered on a blueprint or the application with
+:meth:`~flask.Flask.add_representation` (or the
+:meth:`~flask.Flask.representation` decorator). They apply to every
+endpoint that does not declare its own representations. An endpoint
+declaration takes precedence over a blueprint's defaults, which take
+precedence over the application's defaults; a declaration at any level
+replaces the entire set from a less specific level. Endpoints without
+any declaration at any level are never negotiated.
+
+.. code-block:: python
+
+    app.add_representation("application/json", jsonify)
+
+Invalid declarations, such as duplicate content types, missing
+generators, or unparseable content types, raise an error before the
+application starts serving requests.

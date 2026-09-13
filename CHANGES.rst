@@ -30,6 +30,17 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   Add opt-in representation (content) negotiation. Views and the
+    methods of class-based views can declare the representations they
+    offer with :func:`flask.representations` and
+    :class:`flask.Representation`. The framework selects the best match
+    for the request's ``Accept`` header, including quality factors and
+    wildcards, sets the response content type, and adds ``Vary: Accept``.
+    Defaults can be declared on an application or blueprint with
+    :meth:`Flask.add_representation` and :meth:`Flask.representation`.
+    Requests that cannot accept any offered representation get a ``406``
+    response listing the available representations. Endpoints without
+    declarations behave exactly as before.
 
 
 Version 3.1.3

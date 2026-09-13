@@ -50,6 +50,14 @@ Response Objects
     :inherited-members:
     :exclude-members: json_module
 
+Representation Negotiation
+---------------------------
+
+.. autoclass:: flask.Representation
+    :members:
+
+.. autofunction:: flask.representations
+
 Sessions
 --------
 

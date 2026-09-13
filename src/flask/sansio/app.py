@@ -26,6 +26,7 @@ from ..helpers import get_debug_flag
 from ..json.provider import DefaultJSONProvider
 from ..json.provider import JSONProvider
 from ..logging import create_logger
+from ..negotiation import RepresentationMap
 from ..templating import DispatchingJinjaLoader
 from ..templating import Environment
 from .scaffold import _endpoint_from_view_func
@@ -372,6 +373,16 @@ class App(Scaffold):
         #:
         #: .. versionadded:: 0.7
         self.blueprints: dict[str, Blueprint] = {}
+
+        #: Maps blueprint names to the representations declared as
+        #: defaults by that blueprint. The key is the registered name of
+        #: a blueprint, including nested names such as ``"parent.child"``.
+        #: Application-wide defaults are stored on
+        #: :attr:`Scaffold.representation_map` instead.
+        #:
+        #: This data structure is internal. It should not be modified
+        #: directly and its format may change at any time.
+        self.representation_specs: dict[str, RepresentationMap] = {}
 
         #: a place where extensions can store application specific state.  For
         #: example this is where an extension could store database engines and

@@ -16,6 +16,9 @@ from werkzeug.utils import cached_property
 
 from .. import typing as ft
 from ..helpers import get_root_path
+from ..negotiation import Representation
+from ..negotiation import RepresentationMap
+from ..negotiation import representations as _representations
 from ..templating import _default_template_ctx_processor
 
 if t.TYPE_CHECKING:  # pragma: no cover
@@ -37,6 +40,9 @@ T_url_value_preprocessor = t.TypeVar(
     "T_url_value_preprocessor", bound=ft.URLValuePreprocessorCallable
 )
 T_route = t.TypeVar("T_route", bound=ft.RouteCallable)
+T_representation = t.TypeVar(
+    "T_representation", bound=ft.RepresentationGeneratorCallable
+)
 
 
 def setupmethod(f: F) -> F:
@@ -213,6 +219,19 @@ class Scaffold:
         self.url_default_functions: dict[
             ft.AppOrBlueprintKey, list[ft.URLDefaultCallable]
         ] = defaultdict(list)
+
+        #: The representations offered by default by every endpoint on
+        #: this object, or ``None`` if no defaults were declared. More
+        #: specific declarations on blueprints or endpoints take
+        #: precedence as a complete set.
+        #:
+        #: Use :meth:`add_representation` or :meth:`representation` to
+        #: populate this. It is ``None`` by default, so endpoints without
+        #: representation declarations keep their existing behavior.
+        #:
+        #: This data structure is internal. It should not be modified
+        #: directly and its format may change at any time.
+        self.representation_map: RepresentationMap | None = None
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r}>"
@@ -463,6 +482,114 @@ class Scaffold:
             return f
 
         return decorator
+
+    @setupmethod
+    def add_representation(
+        self,
+        content_type: str | Representation,
+        func: ft.RepresentationGeneratorCallable | None = None,
+    ) -> ft.RepresentationGeneratorCallable:
+        """Register a representation offered by default by every endpoint
+        on this application or blueprint.
+
+        Endpoint-level declarations take precedence over a blueprint's
+        defaults, which take precedence over an application's defaults.
+        Endpoints without any declarations keep their existing behavior.
+
+        This is available on both app and blueprint objects. Use
+        :meth:`representation` as a decorator, or the standalone
+        :func:`~flask.representations` decorator to declare the
+        representations of a specific view or class-based view method.
+
+        .. code-block:: python
+
+            app.add_representation("application/json", jsonify)
+
+        :param content_type: The media type, such as
+            ``"application/json"``. May include parameters. A
+            :class:`~flask.Representation` may be passed instead.
+        :param func: The callable that generates the response from the
+            view's return value. Required unless ``content_type`` is a
+            :class:`~flask.Representation`.
+
+        .. versionadded:: 3.2
+        """
+        if isinstance(content_type, Representation):
+            if func is not None:
+                raise TypeError(
+                    "A generator function can't be passed separately when"
+                    " passing a 'Representation' object."
+                )
+
+            representation = content_type
+        else:
+            if func is None:
+                raise ValueError(
+                    "A generator function is required when registering a"
+                    " representation."
+                )
+
+            representation = Representation(content_type, func)
+
+        if self.representation_map is None:
+            self.representation_map = RepresentationMap()
+
+        self.representation_map.add(representation)
+        return representation.func
+
+    @setupmethod
+    def representation(
+        self, content_type: str
+    ) -> t.Callable[[T_representation], T_representation]:
+        """Decorate a function to register it as a default representation
+        for every endpoint on this application or blueprint. See
+        :meth:`add_representation` for more information.
+
+        .. code-block:: python
+
+            @app.representation("application/json")
+            def as_json(resource):
+                return jsonify(resource)
+
+        To declare representations for one view instead, use the
+        standalone :func:`~flask.representations` decorator.
+
+        :param content_type: The media type, such as
+            ``"application/json"``.
+
+        .. versionadded:: 3.2
+        """
+
+        def decorator(f: T_representation) -> T_representation:
+            self.add_representation(content_type, f)
+            return f
+
+        return decorator
+
+    def representations(
+        self,
+        *declared: Representation | tuple[str, ft.RepresentationGeneratorCallable],
+    ) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to declare the representations it can
+        produce. This only marks the view; use it together with
+        :meth:`route` or :meth:`add_url_rule`.
+
+        It is equivalent to the standalone :func:`~flask.representations`
+        decorator and is available on both app and blueprint objects.
+
+        .. code-block:: python
+
+            @bp.route("/resource")
+            @bp.representations(
+                Representation("application/json", as_json),
+                Representation("text/html", as_html),
+            )
+            def resource():
+                return get_resource()
+
+        .. versionadded:: 3.2
+        """
+        return _representations(*declared)
 
     @setupmethod
     def before_request(self, f: T_before_request) -> T_before_request:
