@@ -26,6 +26,7 @@ from ..helpers import get_debug_flag
 from ..json.provider import DefaultJSONProvider
 from ..json.provider import JSONProvider
 from ..logging import create_logger
+from ..snapshot import take_snapshot
 from ..templating import DispatchingJinjaLoader
 from ..templating import Environment
 from .scaffold import _endpoint_from_view_func
@@ -600,6 +601,32 @@ class App(Scaffold):
         .. versionadded:: 0.11
         """
         return self.blueprints.values()
+
+    def registration_snapshot(
+        self, *, include_sensitive: bool = False
+    ) -> dict[str, t.Any]:
+        """Export everything registered on this application as a stable,
+        JSON-serializable structure.
+
+        The snapshot covers routes (including host, subdomain, methods
+        and defaults), blueprints and their nesting, request hooks and
+        error handlers with their source and registration order, the
+        template loader chain, static folders, registered extensions
+        and CLI commands. Every item states whether it was registered
+        on the application or a blueprint, along with its sequence
+        number within that scope.
+
+        Taking a snapshot does not execute any view, hook or signal and
+        does not modify the application. Repeated exports of the same
+        application are byte-identical. Two snapshots can be compared
+        with :func:`flask.snapshot.diff_snapshots`.
+
+        :param include_sensitive: Keep values associated with
+            secret-sounding keys instead of redacting them.
+
+        .. versionadded:: 3.2
+        """
+        return take_snapshot(self, include_sensitive=include_sensitive)
 
     @setupmethod
     def add_url_rule(

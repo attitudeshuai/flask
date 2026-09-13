@@ -125,6 +125,16 @@ class Scaffold:
             dict[int | None, dict[type[Exception], ft.ErrorHandlerCallable]],
         ] = defaultdict(lambda: defaultdict(dict))
 
+        #: Every error handler registered through
+        #: :meth:`register_error_handler`, in registration order, as
+        #: ``(code, exception_class, handler)`` tuples. Unlike
+        #: :attr:`error_handler_spec`, this keeps handlers that were
+        #: overwritten by a later registration for the same slot. It is
+        #: read-only introspection data used by the registration snapshot.
+        self._error_handler_history: list[
+            tuple[int | None, type[Exception], ft.ErrorHandlerCallable]
+        ] = []
+
         #: A data structure of functions to call at the beginning of
         #: each request, in the format ``{scope: [functions]}``. The
         #: ``scope`` key is the name of a blueprint the functions are
@@ -660,6 +670,7 @@ class Scaffold:
         """
         exc_class, code = self._get_exc_class_and_code(code_or_exception)
         self.error_handler_spec[None][code][exc_class] = f
+        self._error_handler_history.append((code, exc_class, f))
 
     @staticmethod
     def _get_exc_class_and_code(

@@ -4,6 +4,7 @@ import ast
 import collections.abc as cabc
 import importlib.metadata
 import inspect
+import json
 import os
 import platform
 import re
@@ -23,6 +24,9 @@ from werkzeug.utils import import_string
 from .globals import current_app
 from .helpers import get_debug_flag
 from .helpers import get_load_dotenv
+from .snapshot import diff_snapshots
+from .snapshot import format_snapshot_diff
+from .snapshot import SnapshotError
 
 if t.TYPE_CHECKING:
     import ssl
@@ -594,6 +598,8 @@ class FlaskGroup(AppGroup):
             self.add_command(run_command)
             self.add_command(shell_command)
             self.add_command(routes_command)
+            self.add_command(snapshot_command)
+            self.add_command(snapshot_diff_command)
 
         self._loaded_plugin_commands = False
 
@@ -1105,6 +1111,87 @@ def routes_command(sort: str, all_methods: bool) -> None:
 
     for row in rows:
         click.echo(template.format(*row))
+
+
+@click.command("snapshot", short_help="Export the app's registration state.")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Write the JSON snapshot to this file instead of standard output.",
+)
+@click.option(
+    "--include-sensitive",
+    is_flag=True,
+    default=False,
+    help="Do not redact values associated with secret-sounding keys.",
+)
+@pass_script_info
+def snapshot_command(
+    info: ScriptInfo, output: str | None, include_sensitive: bool
+) -> None:
+    """Export everything registered on the application -- routes,
+    blueprints, hooks, error handlers, template loaders, static folders,
+    extensions and CLI commands -- as a deterministic JSON snapshot.
+
+    The snapshot does not run any view, hook or signal handler.
+    """
+    app = info.load_app()
+    data = app.registration_snapshot(include_sensitive=include_sensitive)
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+    if output is not None:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        click.echo(text, nl=False)
+
+
+def _load_snapshot_file(path: str) -> t.Any:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except OSError as e:
+        raise click.UsageError(f"Could not read snapshot file {path!r}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise click.UsageError(
+            f"Snapshot file {path!r} is not valid JSON: {e}"
+        ) from e
+
+
+@click.command("snapshot-diff", short_help="Compare two registration snapshots.")
+@click.argument("before", type=click.Path(exists=True, dir_okay=False))
+@click.argument("after", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(("text", "json")),
+    default="text",
+    help="Output a readable summary (default) or structured JSON.",
+)
+def snapshot_diff_command(before: str, after: str, fmt: str) -> None:
+    """Compare two snapshots created with the 'snapshot' command or
+    :meth:`Flask.registration_snapshot`, reporting added, removed and
+    changed registrations.
+
+    Exits with status 1 when the snapshots differ.
+    """
+    old = _load_snapshot_file(before)
+    new = _load_snapshot_file(after)
+
+    try:
+        result = diff_snapshots(old, new)
+    except SnapshotError as e:
+        raise click.UsageError(str(e)) from e
+
+    if fmt == "json":
+        click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        click.echo(format_snapshot_diff(result), nl=False)
+
+    if not result["identical"]:
+        click.get_current_context().exit(1)
 
 
 cli = FlaskGroup(
