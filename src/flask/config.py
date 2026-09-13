@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import collections.abc as cabc
+import contextvars
 import errno
 import json
 import os
 import types
 import typing as t
+import weakref
+from contextlib import contextmanager
 
 from werkzeug.utils import import_string
+
+from .globals import _cv_app
 
 if t.TYPE_CHECKING:
     import typing_extensions as te
 
+    from .ctx import AppContext
     from .sansio.app import App
 
 
@@ -45,6 +52,144 @@ class ConfigAttribute(t.Generic[T]):
 
     def __set__(self, obj: App, value: t.Any) -> None:
         obj.config[self.__name__] = value
+
+
+class ConfigOverrideScope:
+    """A single layer of temporary :class:`Config` value overrides.
+
+    Scopes form a stack kept in a :class:`~contextvars.ContextVar`. When a
+    key is read from the config, the scopes are searched from the innermost
+    scope outward. If no scope declares the key, the application-level value
+    is used.
+
+    A scope is created explicitly with :meth:`Config.override`, or lazily for
+    the current request by :meth:`Config.declare_override`. User code should
+    not instantiate this class. Objects are returned by
+    :meth:`Config.override` and :meth:`Config.override_source` for
+    inspection.
+
+    :param kind: ``"scope"`` for an explicit scope or ``"request"`` when the
+        scope is bound to a request.
+    :param name: A human-readable name, used in errors and ``repr``.
+    :param values: The overrides initially declared in the scope.
+    :param ctx: The request context the scope is bound to, if any.
+    """
+
+    __slots__ = (
+        "kind",
+        "name",
+        "_values",
+        "_ctx",
+        "_var",
+        "_token",
+        "_old",
+    )
+
+    def __init__(
+        self,
+        kind: str,
+        name: str,
+        values: cabc.Mapping[str, t.Any],
+        ctx: AppContext | None = None,
+    ) -> None:
+        self.kind: str = kind
+        """``"scope"`` for an explicit scope or ``"request"`` for a scope
+        bound to a request."""
+
+        self.name: str = name
+        """The name of the scope. ``"request"`` for a request scope, or the
+        ``name`` passed to :meth:`Config.override` (default ``"override"``)."""
+
+        self._values: dict[str, t.Any] = dict(values)
+        self._ctx: weakref.ref[AppContext] | None = (
+            weakref.ref(ctx) if ctx is not None else None
+        )
+        self._var: (
+            contextvars.ContextVar[tuple[ConfigOverrideScope, ...] | None] | None
+        ) = None
+        self._token: (
+            contextvars.Token[tuple[ConfigOverrideScope, ...] | None] | None
+        ) = None
+        self._old: tuple[ConfigOverrideScope, ...] | None = None
+
+    @property
+    def ctx(self) -> AppContext | None:
+        """The request context this scope is bound to, or ``None`` for an
+        explicit scope."""
+        return self._ctx() if self._ctx is not None else None
+
+    @property
+    def values(self) -> cabc.Mapping[str, t.Any]:
+        """A read-only mapping of the values declared in this scope."""
+        return types.MappingProxyType(self._values)
+
+    def declare(self, key: str, value: t.Any) -> None:
+        """Declare ``key`` as ``value`` in this scope.
+
+        Each key can only be declared once per scope; a nested scope may
+        shadow the same key.
+
+        :raise TypeError: if ``key`` is not a string.
+        :raise ValueError: if ``key`` is already declared in this scope.
+        """
+        if not isinstance(key, str):
+            raise TypeError(
+                "Config override keys must be strings, got" f" {type(key).__name__!r}."
+            )
+
+        if key in self._values:
+            raise ValueError(
+                f"Config override for {key!r} is already declared in the"
+                f" {self.name!r} scope; remove it or declare the override in"
+                " a nested scope instead."
+            )
+
+        self._values[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._values
+
+    def __getitem__(self, key: str) -> t.Any:
+        return self._values[key]
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} {self.kind} {self.name!r}" f" {self._values!r}>"
+
+    def _bind(
+        self,
+        var: contextvars.ContextVar[tuple[ConfigOverrideScope, ...] | None],
+    ) -> None:
+        """Push this scope onto ``var`` and remember how to undo it."""
+        self._old = var.get(None)
+        self._var = var
+        self._token = var.set((self._old or ()) + (self,))
+
+    def restore(self) -> None:
+        """Remove this scope, restoring the state from before it was pushed.
+
+        Safe to call more than once. Works even if the scope was pushed in a
+        different copied :class:`~contextvars.Context` (for example when a
+        request scope is first declared inside an async task), in which case
+        the context variable is set back explicitly instead of reset with the
+        token.
+        """
+        token = self._token
+
+        if token is None or self._var is None:
+            return
+
+        var = self._var
+        old = self._old
+        self._token = None
+
+        try:
+            var.reset(token)
+        except ValueError:
+            # The token belongs to a different Context. Its changes never
+            # affected this Context; putting back the old value is equivalent
+            # to resetting and cannot remove someone else's override because
+            # this Context's value was not changed by that token.
+            var.set(old)
 
 
 class Config(dict):  # type: ignore[type-arg]
@@ -98,6 +243,327 @@ class Config(dict):  # type: ignore[type-arg]
     ) -> None:
         super().__init__(defaults or {})
         self.root_path = root_path
+        #: Stack of active override scopes, or ``None`` when no overrides
+        #: have been declared. Stored in a ContextVar so that concurrent
+        #: requests, threads and async tasks never see each other's
+        #: overrides.
+        self._cv_overrides: contextvars.ContextVar[
+            tuple[ConfigOverrideScope, ...] | None
+        ] = contextvars.ContextVar(f"flask.config-overrides.{id(self)}")
+
+    # -- request- and scope-local config overrides --------------------------
+
+    @contextmanager
+    def override(
+        self,
+        mapping: cabc.Mapping[str, t.Any] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        **values: t.Any,
+    ) -> t.Iterator[ConfigOverrideScope]:
+        """Open an explicit configuration override scope.
+
+        Within the ``with`` block, reading a key from this config resolves
+        through the overrides declared in this scope and any enclosing
+        scopes before falling back to the application-level values. When the
+        block exits -- for any reason, including an exception -- the scope
+        is removed completely. Scopes may be nested; the innermost scope
+        that declares a key wins.
+
+        Overrides may be given as a mapping and/or keyword arguments. Further
+        values may be declared inside the block with
+        :meth:`declare_override` or :meth:`ConfigOverrideScope.declare`.
+
+        .. code-block:: python
+
+            with app.config.override(DEBUG=True):
+                assert app.config["DEBUG"] is True
+
+        :param mapping: An optional mapping of keys to override.
+        :param name: A name for the scope, shown when inspecting
+            :meth:`override_source`. Defaults to ``"override"``.
+        :param values: Additional keys to override as keyword arguments.
+        """
+        scope = ConfigOverrideScope(
+            "scope",
+            name if name is not None else "override",
+            self._prepare_values(mapping, values),
+        )
+        scope._bind(self._cv_overrides)
+
+        try:
+            yield scope
+        finally:
+            scope.restore()
+
+    # Explicit, descriptive alias.
+    override_scope = override
+
+    def declare_override(self, key: str, value: t.Any) -> None:
+        """Declare a temporary override for ``key``.
+
+        Inside an explicit :meth:`override` scope, the value is declared in
+        the innermost scope. Otherwise it is bound to the current request
+        and removed automatically when the request context is popped, no
+        matter how the request ends.
+
+        Each key may only be declared once per scope; declare it again in a
+        nested scope to shadow it.
+
+        :param key: The config key to override. Must be a string.
+        :param value: The temporary value.
+        :raise TypeError: if ``key`` is not a string.
+        :raise ValueError: if ``key`` is already declared in the target
+            scope.
+        :raise RuntimeError: if called outside of a request and outside of
+            an explicit override scope.
+        """
+        self._scope_for_declare().declare(key, value)
+
+    def declare_overrides(
+        self,
+        mapping: cabc.Mapping[str, t.Any] | None = None,
+        /,
+        **values: t.Any,
+    ) -> None:
+        """Declare multiple temporary overrides at once.
+
+        Behaves like :meth:`declare_override`, taking a mapping and/or
+        keyword arguments. If any declaration is invalid nothing is
+        declared.
+
+        :raise TypeError: if ``mapping`` is not a mapping or a key is not a
+            string.
+        :raise ValueError: if the same key is given more than once or is
+            already declared in the target scope.
+        :raise RuntimeError: if called outside of a request and outside of
+            an explicit override scope.
+        """
+        scope = self._scope_for_declare()
+        prepared = self._prepare_values(mapping, values)
+
+        for key in prepared:
+            if key in scope:
+                raise ValueError(
+                    f"Config override for {key!r} is already declared in the"
+                    f" {scope.name!r} scope; remove it or declare the"
+                    " override in a nested scope instead."
+                )
+
+        scope._values.update(prepared)
+
+    def override_source(self, key: str) -> ConfigOverrideScope | None:
+        """Return the scope supplying the effective value of ``key``.
+
+        :return: The innermost active scope that declares ``key``, or
+            ``None`` if the value comes from the application config (or
+            ``key`` is not present anywhere). The returned scope's
+            :attr:`~ConfigOverrideScope.kind` is ``"request"`` for
+            request-bound overrides and ``"scope"`` for an explicit
+            :meth:`override` block, and :attr:`~ConfigOverrideScope.name`
+            identifies the layer.
+        """
+        stack = self._cv_overrides.get(None)
+
+        if stack is not None:
+            for scope in reversed(stack):
+                if key in scope:
+                    return scope
+
+        return None
+
+    def _scope_for_declare(self) -> ConfigOverrideScope:
+        """Find the scope a new declaration belongs in, opening a request
+        scope if needed."""
+        stack = self._cv_overrides.get(None)
+
+        if stack:
+            scope = stack[-1]
+
+            if scope.kind == "scope":
+                return scope
+
+            ctx = _cv_app.get(None)
+
+            if ctx is not None and scope.ctx is ctx:
+                # Innermost request scope belongs to the current (possibly
+                # re-pushed) request context.
+                return scope
+
+            # The innermost request scope belongs to an enclosing context.
+            # Fall through to open another layer for this context.
+
+        ctx = _cv_app.get(None)
+
+        if ctx is None or not ctx.has_request:
+            raise RuntimeError(
+                "Cannot declare a config override outside of an override"
+                " scope: use 'with app.config.override(...)' or call"
+                " 'declare_override' while handling a request."
+            )
+
+        scope = ConfigOverrideScope("request", "request", {}, ctx=ctx)
+        scope._bind(self._cv_overrides)
+        ctx._config_scopes.append(scope)
+        return scope
+
+    @staticmethod
+    def _prepare_values(
+        mapping: cabc.Mapping[str, t.Any] | None, values: dict[str, t.Any]
+    ) -> dict[str, t.Any]:
+        """Validate and combine the mapping and keyword arguments passed to
+        override-declaring APIs."""
+        if mapping is not None and not isinstance(mapping, cabc.Mapping):
+            raise TypeError(
+                "Config overrides must be declared with a mapping and/or"
+                " keyword arguments; got a"
+                f" {type(mapping).__name__!r} instead."
+            )
+
+        prepared: dict[str, t.Any] = dict(mapping) if mapping is not None else {}
+
+        for key, value in values.items():
+            if key in prepared:
+                raise ValueError(
+                    f"Config override for {key!r} was declared more than"
+                    " once in the same scope."
+                )
+
+            prepared[key] = value
+
+        for key in prepared:
+            if not isinstance(key, str):
+                raise TypeError(
+                    "Config override keys must be strings, got"
+                    f" {type(key).__name__!r}."
+                )
+
+        return prepared
+
+    def _merged(self, stack: tuple[ConfigOverrideScope, ...]) -> dict[str, t.Any]:
+        """Build a snapshot of the application values with all active
+        overrides applied (innermost wins).
+
+        Uses the base ``dict`` methods explicitly; calling ``dict.copy`` or
+        ``dict(self)`` would resolve through the overridden mapping methods
+        and recurse back here.
+        """
+        merged = {key: dict.__getitem__(self, key) for key in dict.__iter__(self)}
+
+        for scope in stack:
+            merged.update(scope._values)
+
+        return merged
+
+    # -- dict protocol with override resolution ----------------------------
+
+    def __getitem__(self, key: str) -> t.Any:
+        stack = self._cv_overrides.get(None)
+
+        if stack is not None:
+            for scope in reversed(stack):
+                values = scope._values
+
+                if key in values:
+                    return values[key]
+
+        return dict.__getitem__(self, key)
+
+    def get(self, key: str, default: t.Any = None) -> t.Any:
+        stack = self._cv_overrides.get(None)
+
+        if stack is not None:
+            for scope in reversed(stack):
+                values = scope._values
+
+                if key in values:
+                    return values[key]
+
+        return dict.get(self, key, default)
+
+    def __contains__(self, key: object) -> bool:
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.__contains__(self, key)
+
+        if dict.__contains__(self, key):
+            return True
+
+        return any(key in scope._values for scope in stack)
+
+    def __len__(self) -> int:
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.__len__(self)
+
+        return len(self._merged(stack))
+
+    def __iter__(self) -> t.Iterator[str]:
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.__iter__(self)
+
+        def _iter() -> t.Iterator[str]:
+            seen: set[str] = set()
+
+            for key in dict.__iter__(self):
+                seen.add(key)
+                yield key
+
+            for scope in stack:
+                for key in scope._values:
+                    if key not in seen:
+                        seen.add(key)
+                        yield key
+
+        return _iter()
+
+    def keys(self) -> t.KeysView[str]:  # type: ignore[override]
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.keys(self)
+
+        return self._merged(stack).keys()
+
+    def items(self) -> t.ItemsView[str, t.Any]:  # type: ignore[override]
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.items(self)
+
+        return self._merged(stack).items()
+
+    def values(self) -> t.ValuesView[t.Any]:  # type: ignore[override]
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.values(self)
+
+        return self._merged(stack).values()
+
+    def __eq__(self, other: object) -> bool:
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return dict.__eq__(self, other)
+
+        if isinstance(other, cabc.Mapping):
+            return self._merged(stack) == other
+
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        stack = self._cv_overrides.get(None)
+
+        if stack is None:
+            return f"<{type(self).__name__} {dict.__repr__(self)}>"
+
+        return f"<{type(self).__name__} {self._merged(stack)!r}>"
 
     def from_envvar(self, variable_name: str, silent: bool = False) -> bool:
         """Loads a configuration from an environment variable pointing to
@@ -362,6 +828,3 @@ class Config(dict):  # type: ignore[type-arg]
                 key = key.lower()
             rv[key] = v
         return rv
-
-    def __repr__(self) -> str:
-        return f"<{type(self).__name__} {dict.__repr__(self)}>"

@@ -30,6 +30,13 @@ Unreleased
     of only lower case file extensions. :pr:`6012`
 -   Fix parsing IPv6 with port in ``run`` and the test client. :pr:`6096`
 -   Add ``app.query`` route decorator for the HTTP QUERY method.
+-   Add request- and scope-local configuration overrides. Use
+    ``app.config.override(KEY=value)`` as a context manager for an explicit
+    scope, or ``app.config.declare_override(key, value)`` during a request.
+    Overrides are scoped per thread and async task, resolve innermost-first
+    with fallback to the application value, and are restored automatically
+    when the scope or request ends. Use ``app.config.override_source(key)``
+    to check which layer supplies the effective value.
 
 
 Version 3.1.3

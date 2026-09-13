@@ -42,6 +42,76 @@ method::
     )
 
 
+Request/Scope Local Overrides
+-----------------------------
+
+.. versionadded:: 3.2
+
+Sometimes a configuration value should change only for a specific request
+or section of code -- for example a multi-tenant setting, a feature flag
+for a staged rollout, or behavior that differs per client. Mutating
+``app.config`` directly would change the value for every other request in
+the process. Instead, an *override scope* can temporarily replace values:
+
+.. code-block:: python
+
+    with app.config.override(IMAGE_STORE_TYPE="s3"):
+        # Reads resolve through the override, including code in extensions.
+        assert app.config["IMAGE_STORE_TYPE"] == "s3"
+
+    # The application value is visible again.
+    assert app.config["IMAGE_STORE_TYPE"] == "fs"
+
+The override accepts a mapping and/or keyword arguments, and is removed
+automatically when the block exits, even if an exception is raised.
+Scopes may be nested; the innermost scope that declares a key wins, and
+when it exits the enclosing scope applies again. Values can also be
+declared after the scope is opened:
+
+.. code-block:: python
+
+    with app.config.override() as scope:
+        scope.declare("TENANT_ID", tenant.id)
+        # Or, declaring in the innermost active scope:
+        app.config.declare_override("FEATURE_X", True)
+
+While handling a request, overrides can be declared without an explicit
+block. They are bound to the current request and are removed when the
+request context is popped, no matter how the request ends:
+
+.. code-block:: python
+
+    @app.before_request
+    def set_tenant_config():
+        app.config.declare_override("TENANT_ID", request.headers["X-Tenant"])
+
+Overrides are isolated per thread and per async task through
+:mod:`contextvars`, so concurrent requests and tasks never see each
+other's values. While an override is active, the config still behaves as
+a dictionary -- membership (``in``), ``len()``, iteration, ``keys()``,
+``items()`` and ``values()`` all reflect the resolved values -- and
+everything returns to normal once the scope exits.
+
+Use :meth:`~flask.Config.override_source` to check where the effective
+value of a key comes from. It returns the scope object (with ``kind``
+``"request"`` or ``"scope"`` and a ``name``), or ``None`` when the value
+comes from the application itself:
+
+.. code-block:: python
+
+    with app.config.override(DEBUG=True, name="debug-scope"):
+        source = app.config.override_source("DEBUG")
+        assert source.kind == "scope"
+        assert source.name == "debug-scope"
+
+Each key may be declared only once per scope; declare it in a nested
+scope to shadow it. Declaring an override outside of a request and
+outside of an :meth:`~flask.Config.override` block raises a
+:exc:`RuntimeError`, non-string keys and non-mapping arguments raise a
+:exc:`TypeError`, and declaring the same key twice in one scope raises a
+:exc:`ValueError`.
+
+
 Debug Mode
 ----------
 

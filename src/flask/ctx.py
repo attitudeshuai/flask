@@ -19,6 +19,7 @@ if t.TYPE_CHECKING:
     from _typeshed.wsgi import WSGIEnvironment
 
     from .app import Flask
+    from .config import ConfigOverrideScope
     from .sessions import SessionMixin
     from .wrappers import Request
 
@@ -321,6 +322,9 @@ class AppContext:
         self._session: SessionMixin | None = session
         self._flashes: list[tuple[str, str]] | None = None
         self._after_request_functions: list[ft.AfterRequestCallable[t.Any]] = []
+        self._config_scopes: list[ConfigOverrideScope] = []
+        """Config override scopes bound to this request, restored when the
+        context is popped."""
 
         try:
             self.url_adapter = app.create_url_adapter(self._request)
@@ -494,6 +498,15 @@ class AppContext:
 
         with collect_errors:
             self.app.do_teardown_appcontext(self, exc)
+
+        # Restore configuration overrides declared for this request. This
+        # runs after all teardown callbacks so they still saw the overrides,
+        # and a failing callback above does not prevent the restoration.
+        for scope in reversed(self._config_scopes):
+            with collect_errors:
+                scope.restore()
+
+        self._config_scopes.clear()
 
         _cv_app.reset(self._cv_token)
         self._cv_token = None
