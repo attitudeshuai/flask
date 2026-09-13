@@ -321,6 +321,10 @@ class AppContext:
         self._session: SessionMixin | None = session
         self._flashes: list[tuple[str, str]] | None = None
         self._after_request_functions: list[ft.AfterRequestCallable[t.Any]] = []
+        #: The concurrency quota slot held by this request, or ``None``.
+        self._concurrency_grant: t.Any = None
+        #: Suggested retry time when this request was rejected by a quota.
+        self._concurrency_retry_after: int | None = None
 
         try:
             self.url_adapter = app.create_url_adapter(self._request)

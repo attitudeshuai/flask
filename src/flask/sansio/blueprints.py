@@ -320,6 +320,12 @@ class Blueprint(Scaffold):
         self._got_registered_once = True
         state = self.make_setup_state(app, options, first_bp_registration)
 
+        # A blueprint quota is recorded for each registration name, so a
+        # blueprint registered more than once gets separate quota state while
+        # sharing the same declaration.
+        if self._concurrency_limit is not None:
+            app._blueprint_concurrency_limits[name] = self._concurrency_limit
+
         if self.has_static_folder:
             state.add_url_rule(
                 f"{self.static_url_path}/<path:filename>",

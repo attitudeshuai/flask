@@ -18,6 +18,7 @@ import click
 from werkzeug.datastructures import Headers
 from werkzeug.datastructures import ImmutableDict
 from werkzeug.exceptions import BadRequestKeyError
+from werkzeug.exceptions import default_exceptions
 from werkzeug.exceptions import HTTPException
 from werkzeug.exceptions import InternalServerError
 from werkzeug.routing import BuildError
@@ -27,10 +28,17 @@ from werkzeug.routing import RoutingException
 from werkzeug.routing import Rule
 from werkzeug.serving import is_running_from_reloader
 from werkzeug.wrappers import Response as BaseResponse
+from werkzeug.wsgi import ClosingIterator
 from werkzeug.wsgi import get_host
 
 from . import cli
 from . import typing as ft
+from .concurrency import _Rejection
+from .concurrency import CONCURRENCY_QUOTA_ATTRIBUTE
+from .concurrency import ConcurrencyManager
+from .concurrency import REJECTED_IN_FLIGHT
+from .concurrency import REJECTED_QUEUE_FULL
+from .concurrency import REJECTED_WAIT_TIMEOUT
 from .ctx import AppContext
 from .globals import _cv_app
 from .globals import app_ctx
@@ -79,6 +87,9 @@ def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
 
 
 F = t.TypeVar("F", bound=t.Callable[..., t.Any])
+
+#: Sentinel for a concurrency manager that has not been built on first request.
+_concurrency_unbuilt = object()
 
 
 # Other methods may call the overridden method with the new ctx arg. Remove it
@@ -343,6 +354,13 @@ class Flask(App):
         # Set the name of the Click group in case someone wants to add
         # the app's commands to another CLI tool.
         self.cli.name = self.name
+
+        #: Runtime state of the declared concurrency quotas. ``None`` means
+        #: no quotas were declared; the sentinel means it has not been built
+        #: yet. Built once, before the first request is handled.
+        self._concurrency_manager: ConcurrencyManager | None | object = (
+            _concurrency_unbuilt
+        )
 
         # Add a static route using the provided static_url_path, static_host,
         # and static_folder if there is a configured static_folder.
@@ -992,6 +1010,135 @@ class Flask(App):
         view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
         return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
 
+    def _has_concurrency_quotas(self) -> bool:
+        return (
+            self._concurrency_limit is not None
+            or bool(self._blueprint_concurrency_limits)
+            or any(
+                getattr(func, CONCURRENCY_QUOTA_ATTRIBUTE, None) is not None
+                for func in self.view_functions.values()
+            )
+        )
+
+    def _make_concurrency_manager(self) -> ConcurrencyManager | None:
+        """Build the manager from the current quota declarations. Returns
+        ``None`` when no quota was declared, leaving requests with the same
+        behavior and overhead as without the feature."""
+        if not self._has_concurrency_quotas():
+            return None
+
+        return ConcurrencyManager(self)
+
+    def _ensure_concurrency_manager(self) -> None:
+        """Build and freeze the manager once, before the first request is
+        handled. Setup methods cannot change declarations afterwards."""
+        if self._concurrency_manager is _concurrency_unbuilt:
+            self._concurrency_manager = self._make_concurrency_manager()
+
+    def get_concurrency_stats(self) -> dict[str, dict[str, t.Any]]:
+        """Return a read-only snapshot of every declared concurrency quota's
+        configuration and current occupancy::
+
+            {
+                "endpoint:export": {
+                    "scope": "endpoint",
+                    "name": "export",
+                    "limit": 2,
+                    "wait": True,
+                    "wait_timeout": 30.0,
+                    "max_waiting": 2,
+                    "reject_status": 503,
+                    "retry_after": 30,
+                    "in_flight": 1,
+                    "waiting": 0,
+                    "rejected": 3,
+                },
+                ...
+            }
+
+        Keys are ``"app"``, ``"blueprint:<name>"``, or
+        ``"endpoint:<name>"``. Counts are isolated per application instance
+        and are not shared across processes.
+        """
+        manager = self._concurrency_manager
+
+        if manager is _concurrency_unbuilt or manager is None:
+            manager = self._make_concurrency_manager()
+
+        if manager is None:
+            return {}
+
+        return t.cast(ConcurrencyManager, manager).stats()
+
+    def _concurrency_gate(self, ctx: AppContext) -> None:
+        """Wait for or acquire this request's quota slot. Raises an HTTP
+        exception when the request must be rejected; rejection responses go
+        through the normal error handling and finalization."""
+        manager = self._concurrency_manager
+
+        if manager is None or manager is _concurrency_unbuilt:
+            return
+
+        result = t.cast(ConcurrencyManager, manager).enter(ctx.request)
+
+        if result is None:
+            return
+
+        if not isinstance(result, _Rejection):
+            ctx._concurrency_grant = result
+            return
+
+        quota = result.state.quota
+        quota_name = result.state.key
+        scope, name = quota_name
+        display_name = "app" if scope == "app" else f"{scope}:{name}"
+        retry_after = quota.retry_after
+        ctx._concurrency_retry_after = retry_after
+
+        if result.reason == REJECTED_IN_FLIGHT:
+            message = (
+                f"The concurrency limit of {quota.max_in_flight} in-flight"
+                f" request(s) for '{display_name}' was reached. Retry after"
+                f" {retry_after} second(s)."
+            )
+        elif result.reason == REJECTED_QUEUE_FULL:
+            message = (
+                f"The concurrency limit of {quota.max_in_flight} in-flight"
+                f" request(s) for '{display_name}' was reached and the waiting"
+                f" queue is full ({quota.max_waiting} request(s)). Retry after"
+                f" {retry_after} second(s)."
+            )
+        elif result.reason == REJECTED_WAIT_TIMEOUT:
+            message = (
+                f"Timed out after {quota.wait_timeout:g} second(s) waiting for"
+                f" an in-flight request slot for '{display_name}'. Retry after"
+                f" {retry_after} second(s)."
+            )
+        else:
+            message = "The request was rejected by the concurrency quota."
+
+        exc = default_exceptions[quota.reject_status](description=message)
+        payload = {
+            "error": {
+                "code": quota.reject_status,
+                "name": exc.name,
+                "reason": result.reason,
+                "message": message,
+                "quota": display_name,
+                "retry_after": retry_after,
+            }
+        }
+        exc.response = self.response_class(
+            self.json.dumps(payload),
+            status=quota.reject_status,
+            mimetype="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
+        exc.reason = result.reason  # type: ignore[attr-defined]
+        exc.quota = display_name  # type: ignore[attr-defined]
+        exc.retry_after = retry_after  # type: ignore[attr-defined]
+        raise exc
+
     def full_dispatch_request(self, ctx: AppContext) -> Response:
         """Dispatches the request and on top of that performs request
         pre and postprocessing as well as HTTP exception catching and
@@ -1014,12 +1161,23 @@ class Flask(App):
 
         try:
             request_started.send(self, _async_wrapper=self.ensure_sync)
+            self._concurrency_gate(ctx)
             rv = self.preprocess_request(ctx)
             if rv is None:
                 rv = self.dispatch_request(ctx)
         except Exception as e:
             rv = self.handle_user_exception(ctx, e)
-        return self.finalize_request(ctx, rv)
+
+        response = self.finalize_request(ctx, rv)
+
+        # Ensure the retry hint survives custom error handlers and other
+        # response processing for quota rejections.
+        if ctx._concurrency_retry_after is not None:
+            response.headers.setdefault(
+                "Retry-After", str(ctx._concurrency_retry_after)
+            )
+
+        return response
 
     def finalize_request(
         self,
@@ -1596,27 +1754,50 @@ class Flask(App):
         error: BaseException | None = None
         try:
             try:
-                ctx.push()
-                response = self.full_dispatch_request(ctx)
-            except Exception as e:
-                error = e
-                response = self.handle_exception(ctx, e)
-            except:
-                error = sys.exc_info()[1]
-                raise
-            return response(environ, start_response)
-        finally:
-            if "werkzeug.debug.preserve_context" in environ:
-                environ["werkzeug.debug.preserve_context"](ctx)
+                try:
+                    ctx.push()
+                    self._ensure_concurrency_manager()
+                    response = self.full_dispatch_request(ctx)
+                except Exception as e:
+                    error = e
+                    response = self.handle_exception(ctx, e)
+                except:
+                    error = sys.exc_info()[1]
+                    raise
 
-            if (
-                error is not None
-                and self.should_ignore_error is not None
-                and self.should_ignore_error(error)
-            ):
-                error = None
+                app_iter = response(environ, start_response)
 
-            ctx.pop(error)
+                # Keep the quota slot until the response body has been fully
+                # consumed or closed. The WSGI server calls close() when the
+                # client disconnects as well, so streaming responses cannot
+                # hold a slot indefinitely.
+                if ctx._concurrency_grant is not None:
+                    app_iter = ClosingIterator(app_iter, ctx._concurrency_grant.release)
+
+                return app_iter
+            finally:
+                if "werkzeug.debug.preserve_context" in environ:
+                    environ["werkzeug.debug.preserve_context"](ctx)
+
+                if (
+                    error is not None
+                    and self.should_ignore_error is not None
+                    and self.should_ignore_error(error)
+                ):
+                    error = None
+
+                ctx.pop(error)
+        except BaseException:
+            # No response iterable will reach the server (an error was raised
+            # while dispatching, finalizing, or tearing down the request).
+            # Release the slot on this path too.
+            grant = ctx._concurrency_grant
+
+            if grant is not None:
+                ctx._concurrency_grant = None
+                grant.release()
+
+            raise
 
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse

@@ -6,6 +6,7 @@ import pathlib
 import sys
 import typing as t
 from collections import defaultdict
+from datetime import timedelta
 from functools import update_wrapper
 
 from jinja2 import BaseLoader
@@ -15,6 +16,8 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.utils import cached_property
 
 from .. import typing as ft
+from ..concurrency import CONCURRENCY_QUOTA_ATTRIBUTE
+from ..concurrency import ConcurrencyQuota
 from ..helpers import get_root_path
 from ..templating import _default_template_ctx_processor
 
@@ -106,6 +109,14 @@ class Scaffold:
         #: This data structure is internal. It should not be modified
         #: directly and its format may change at any time.
         self.view_functions: dict[str, ft.RouteCallable] = {}
+
+        #: The concurrency quota declared on this object, or ``None`` if no
+        #: quota was declared. On an application this is the default quota for
+        #: requests not governed by a more specific blueprint or endpoint
+        #: quota. On a blueprint it is the default quota for its endpoints.
+        #:
+        #: Use :meth:`limit_concurrency` to set it.
+        self._concurrency_limit: ConcurrencyQuota | None = None
 
         #: A data structure of registered error handlers, in the format
         #: ``{scope: {code: {class: handler}}}``. The ``scope`` key is
@@ -460,6 +471,90 @@ class Scaffold:
 
         def decorator(f: F) -> F:
             self.view_functions[endpoint] = f
+            return f
+
+        return decorator
+
+    @setupmethod
+    def limit_concurrency(
+        self,
+        max_in_flight: int,
+        *,
+        wait: bool = True,
+        wait_timeout: timedelta | int | float = 30.0,
+        max_waiting: int | None = None,
+        reject_status: int = 503,
+        retry_after: timedelta | int | float | None = None,
+    ) -> None:
+        """Declare a :class:`~flask.ConcurrencyQuota` on the application or
+        blueprint.
+
+        On an application, this is the default quota for any request that is
+        not governed by a more specific blueprint or endpoint quota. On a
+        blueprint, it is the default quota for the blueprint's endpoints.
+        Endpoint declarations (see :meth:`concurrent`) take precedence over
+        blueprint declarations, which take precedence over the application
+        declaration.
+
+        :param max_in_flight: Maximum number of requests handled at the same
+            time within the quota. Must be at least ``1``.
+        :param wait: Whether requests wait for a slot when the limit is
+            reached. If ``False``, they are rejected immediately.
+        :param wait_timeout: Maximum time in seconds (or a
+            :class:`~datetime.timedelta`) a request waits before it is
+            rejected. ``0`` rejects immediately.
+        :param max_waiting: Maximum number of waiting requests. Requests that
+            arrive when the FIFO queue is full are rejected. Defaults to
+            ``max_in_flight``.
+        :param reject_status: HTTP status code for rejected requests.
+            Defaults to ``503``.
+        :param retry_after: Suggested retry time in seconds, sent as the
+            ``Retry-After`` response header. Defaults to ``wait_timeout``.
+        """
+        self._concurrency_limit = ConcurrencyQuota.configure(
+            max_in_flight=max_in_flight,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            max_waiting=max_waiting,
+            reject_status=reject_status,
+            retry_after=retry_after,
+        )
+
+    @setupmethod
+    def concurrent(
+        self,
+        max_in_flight: int,
+        *,
+        wait: bool = True,
+        wait_timeout: timedelta | int | float = 30.0,
+        max_waiting: int | None = None,
+        reject_status: int = 503,
+        retry_after: timedelta | int | float | None = None,
+    ) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to declare an endpoint-level
+        :class:`~flask.ConcurrencyQuota`. This takes precedence over a quota
+        declared on the view's blueprint or application.
+
+        .. code-block:: python
+
+            @app.route("/export")
+            @app.concurrent(2, wait_timeout=10)
+            def export():
+                ...
+
+        See :meth:`limit_concurrency` for the parameter descriptions.
+        """
+        quota = ConcurrencyQuota.configure(
+            max_in_flight=max_in_flight,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            max_waiting=max_waiting,
+            reject_status=reject_status,
+            retry_after=retry_after,
+        )
+
+        def decorator(f: T_route) -> T_route:
+            setattr(f, CONCURRENCY_QUOTA_ATTRIBUTE, quota)
             return f
 
         return decorator

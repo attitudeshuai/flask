@@ -18,6 +18,7 @@ from werkzeug.utils import cached_property
 from werkzeug.utils import redirect as _wz_redirect
 
 from .. import typing as ft
+from ..concurrency import ConcurrencyQuota
 from ..config import Config
 from ..config import ConfigAttribute
 from ..ctx import _AppCtxGlobals
@@ -372,6 +373,12 @@ class App(Scaffold):
         #:
         #: .. versionadded:: 0.7
         self.blueprints: dict[str, Blueprint] = {}
+
+        #: Maps registered blueprint names to the concurrency quotas declared
+        #: on those blueprints. Blueprint declarations are the default quota
+        #: for the blueprint's endpoints; endpoint or application quotas take
+        #: precedence when applicable.
+        self._blueprint_concurrency_limits: dict[str, ConcurrencyQuota] = {}
 
         #: a place where extensions can store application specific state.  For
         #: example this is where an extension could store database engines and
